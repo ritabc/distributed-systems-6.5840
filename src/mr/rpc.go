@@ -12,8 +12,8 @@ import "strconv"
 // Add your RPC definitions here.
 
 type RequestForAssignmentArgs struct {
-	WorkerId    int
-	CurrentTask taskData
+	WorkerId      int
+	CurrentTaskId int
 }
 
 type RequestForAssignmentReply struct {

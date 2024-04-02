@@ -41,17 +41,17 @@ func Worker(mapf func(string, string) []KeyValue,
 	pid := os.Getpid()
 
 	var (
-		currentTask  taskData
-		nextTask     taskData
-		nReduceTasks int
-		nMapTasks    int
-		err          error
-		reduceIdx    int
+		currentTaskId int
+		nextTask      taskData
+		nReduceTasks  int
+		nMapTasks     int
+		err           error
+		reduceIdx     int
 	)
 
 	for reduceIdx = 0; ; {
 		// To get a new task:
-		err = CallRequestForAssignment(pid, currentTask, &nextTask, &nReduceTasks, &nMapTasks)
+		err = CallRequestForAssignment(pid, currentTaskId, &nextTask, &nReduceTasks, &nMapTasks)
 		if err != nil {
 			return
 		}
@@ -66,7 +66,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			os.Exit(0)
 		}
 
-		currentTask = nextTask
+		currentTaskId = nextTask.Id
 	}
 }
 
@@ -204,8 +204,9 @@ func processReduceTask(reducef func(string, []string) string, reduceTaskIdx int)
 	ofile.Close()
 }
 
-func CallRequestForAssignment(workerId int, completedTask taskData, newTaskData *taskData, nReduce *int, nMap *int) error {
-	args := RequestForAssignmentArgs{workerId, completedTask}
+func CallRequestForAssignment(workerId int, completedTaskId int, newTaskData *taskData, nReduce *int,
+	nMap *int) error {
+	args := RequestForAssignmentArgs{workerId, completedTaskId}
 
 	reply := RequestForAssignmentReply{}
 	ok := call("Coordinator.RequestForAssignment", &args, &reply)
