@@ -49,6 +49,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		reduceIdx     int
 	)
 
+	currentTaskId = -1
 	for reduceIdx = 0; ; {
 		// To get a new task:
 		err = CallRequestForAssignment(pid, currentTaskId, &nextTask, &nReduceTasks, &nMapTasks)
