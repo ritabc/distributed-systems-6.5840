@@ -188,7 +188,7 @@ func (c *Coordinator) RequestForAssignment(args *RequestForAssignmentArgs, reply
 		c.mapTasksWg.Wait()
 		c.coordLock.Lock()
 	}
-	reply.NewTask = *nextTask
+	reply.NewTask = nextTask
 	for idx := range c.workers {
 		worker := &c.workers[idx]
 		if worker.id == args.WorkerId {
@@ -209,7 +209,7 @@ func (c *Coordinator) handleTimeouts() {
 		task = c.getTaskFromId(worker.currentTaskId)
 		if task.Id != -1 &&
 			task.Status != completed &&
-			time.Now().Nanosecond()-worker.nanoSecsAtLastRequest > (int)(time.Second*100) {
+			time.Now().Nanosecond()-worker.nanoSecsAtLastRequest > (int)(time.Second*10) {
 
 			// then reclaim the task by resetting its status
 			task.Status = notYetStarted
@@ -230,15 +230,15 @@ func (c *Coordinator) handleTimeouts() {
 	sort.Sort(ByType(c.tasks))
 }
 
-func (c *Coordinator) firstWaitingTask() *taskData {
-	for idx := range c.tasks {
-		task := &c.tasks[idx]
-		if task.Status == notYetStarted {
-			task.Status = inProgress
-			return task
+func (c *Coordinator) firstWaitingTask() taskData {
+	for idx, taskCopy := range c.tasks {
+		taskPtr := &c.tasks[idx]
+		if taskCopy.Status == notYetStarted {
+			taskPtr.Status = inProgress
+			return taskCopy
 		}
 	}
-	return &taskData{-1, noMoreTasks, "", completed}
+	return taskData{-1, noMoreTasks, "", completed}
 }
 
 // start a thread that listens for RPCs from worker.go
