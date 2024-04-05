@@ -258,25 +258,15 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	// TODO Locking this func up causes deadlocks. Does not locking it cause bugs? Yes - even with only 1 worker,
-	// there is a race condition between the coord here and the worker's RPC call
-	// TODO: using tryLock, which the go docs states is usually problematic. If so, come back to here.
-	// TryLock didn't fix the issue
-	if c.coordLock.TryLock() {
-		defer c.coordLock.Unlock()
-		for idx := range c.tasks {
-			task := &c.tasks[idx]
-			if task.Status != completed {
-				return false
-			}
+	c.coordLock.Lock()
+	defer c.coordLock.Unlock()
+	for idx := range c.tasks {
+		task := &c.tasks[idx]
+		if task.Status != completed {
+			return false
 		}
-		return true
 	}
-	// return 'not done' if we someone else has the lock. Maybe not the most standard use case of TryLock,
-	//but I believe this is correct. Done returns true iff it loops through c.tasks (while c is locked) and all are complete.
-	// Otherwise (if any are incomplete OR someone else has the lock)
-	// it returns not Done
-	return false
+	return true
 }
 
 // create a Coordinator.

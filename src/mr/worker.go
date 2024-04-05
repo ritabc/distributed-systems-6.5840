@@ -176,10 +176,9 @@ func processReduceTask(reducef func(string, []string) string, reduceTaskIdx int)
 		}
 	}
 
-	oname := fmt.Sprintf("%v/mr-out-%v", cwd, reduceTaskIdx)
-	ofile, err := os.Create(oname)
+	tmpOutputFile, err := os.CreateTemp("./", fmt.Sprintf("mr-out-%v-tmp", reduceTaskIdx))
 	if err != nil {
-		fmt.Printf("cannot create %v.\n", oname)
+		fmt.Printf("cannot create %v.\n", tmpOutputFile)
 	}
 
 	// Now, all kv pairs that hashed to this reduce worker are in intermediateData
@@ -198,11 +197,13 @@ func processReduceTask(reducef func(string, []string) string, reduceTaskIdx int)
 		}
 		output := reducef(intermediateData[i].Key, values)
 
-		fmt.Fprintf(ofile, "%v %v\n", intermediateData[i].Key, output)
+		fmt.Fprintf(tmpOutputFile, "%v %v\n", intermediateData[i].Key, output)
 
 		i = j
 	}
-	ofile.Close()
+	tmpOutputFile.Close()
+	os.Rename(fmt.Sprintf("./%v", tmpOutputFile.Name()), fmt.Sprintf("./mr-out-%v", reduceTaskIdx))
+
 }
 
 func CallRequestForAssignment(workerId int, completedTaskId int, newTaskData *taskData, nReduce *int,
