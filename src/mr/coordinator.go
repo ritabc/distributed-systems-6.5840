@@ -2,7 +2,6 @@ package mr
 
 import (
 	"log"
-	"sort"
 	"sync"
 	"time"
 )
@@ -27,7 +26,6 @@ const (
 
 type Coordinator struct {
 	tasks        []taskData
-	workers      []workerData
 	nMapTasks    int
 	nReduceTasks int
 	coordLock    sync.Mutex
@@ -35,127 +33,39 @@ type Coordinator struct {
 }
 
 type taskData struct {
-	Id       int
-	TaskType taskType
-	Filename string
-	Status   taskStatus
+	Id            int
+	TaskType      taskType
+	Filename      string
+	Status        taskStatus
+	startTime     time.Time
+	currentWorker int
 }
-
-type workerData struct {
-	id                    int
-	currentTaskId         int
-	nanoSecsAtLastRequest int
-}
-
-type ByType ([]taskData)
-
-func (a ByType) Len() int           { return len(a) }
-func (a ByType) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByType) Less(i, j int) bool { return a[j].TaskType-a[i].TaskType >= 0 }
-
-// Requires locking/unlocking to have been called around the call to this function
-func (c *Coordinator) getTaskFromId(taskId int) *taskData {
-	var t *taskData
-	for i := range c.tasks {
-		t = &c.tasks[i]
-		if t.Id == taskId {
-			return t
-		}
-	}
-	return &taskData{-1, noMoreTasks, "", notYetStarted}
-}
-
-// TODO: break into 2 methods?
-// Both would need to be called under the same lock
-// 1: Any timeouts? If so, edit c.tasks. get a copy of the task that was being edited by the worker (
-// timedOutTaskData). Also get timedOutTask, a pointer to task in c.tasks with id == timedOutTaskData.ID.
-// ID, taskType, filename can stay the same. change status to notYetStarted (
-// presumably from inProgress <- debug statement here. Should not reach on print iff status is !inProgress
-// Also, in this method: sort c.tasks. firstWaitingTask assumes all map tasks are first in the queue,
-// before reduceTasks, before noMoreTasks
-// Find the next task for assigning.
-// First check whether any of c's workers last requested something > 10s ago.
-// / If so, change the task it was working on to notYetStarted
-// / (make sure to return any map tasks first in this case)
-// Then  resolve with the first notYetStarted task (map ones go first)
-// firstWaitingTask looks through allTasks, and finds first waitingTask that has status notYetStarted.
-// It sets that to inProgress before returning
 
 func (c *Coordinator) RequestForAssignment(args *RequestForAssignmentArgs, reply *RequestForAssignmentReply) error {
-	/*
-				Input / Args
-				- ID of worker making request (pid)
-				- the task ID if it had one already. If this was the worker's first task, completedTaskId will be -1
-
-				Output / Reply
-				- newTask taskData
-				- number of reduceTasks
-				- number of map tasks
-
-				What are things we have to do in this function?
-				- Start with what we know: set values of reply.NReduceTasks, reply.NMapTasks
-				- We'll know right away whether this is a worker's 1st or later task, by completedTaskId
-				- If it's the first request:
-				-- add new worker to c.workers with these fields:
-			 	--- workerId
-				--- currentTaskId = -1 TODO: fill in later
-				--- time.Now
-				- else if it's a 2nd/3rd/etc request
-				-- check for and handle timeout, including resorting c.tasks
-				-- update worker's nanoseconds field in c.workers
-				-- TODO: update it's worker's currenttaskId in c.workers later
-		 		-- also, since this is 2nd/3rd/etc request, we must mark the task in c.tasks as complete
-				--- including decrementing from wg if that task was a map one
-				-- next, since we completed a task - are all tasks complete? If so, return early
-
-				- Only then, do we look for the next task
-				-- if there are no tasks with status == notYetStarted, the called method (firstWaitingTask) returns -1
-				-- if firstWaitingTask returns -1, return early after:
-				--- set reply's newTask = {-1, "", noMoreTasks, completed (any status is okay)
-		 		--- in c.workers, find approp worker and set its currentTaskId =  -1
-				-- else, return early after:
-				--- set reply's newTask fields equal to that of firstWaitingTask's return value
-				--- and setting c.workers' taskId == appropriate value
-
-				Scratch:
-				Would we ever need to check for timeout on first request? AKA if completedTaskId == -1.
-				No - because a worker's completedTaskId will be -1 until it calls again. If it calls again,
-				that means it was successful, and therefore completedTaskId != -1
-	*/
+	c.coordLock.Lock()
 
 	// Start by setting what we know
 	// TODO: it'd probably make sense to make separate RPC calls in each worker to get this data (1 per worker, at the start of its life)
-	c.coordLock.Lock()
 
 	reply.NReduceTasks = c.nReduceTasks
 	reply.NMapTasks = c.nMapTasks
 
-	if args.CompletedTaskId == -1 {
-		// this is the first worker
-		c.workers = append(c.workers, workerData{args.WorkerId, -1, time.Now().Nanosecond()})
-	} else {
-		// this is not the first worker
-		c.handleTimeouts()
-
-		// reset this worker's timestamp field in c.workers
-		for idx := range c.workers {
-			worker := &c.workers[idx]
-			if worker.id == args.WorkerId {
-				worker.nanoSecsAtLastRequest = time.Now().Nanosecond()
-			}
-			break
-		}
-
-		// mark the completedtask (since this is a 2nd+ request) as complete
+	// enter this section on a worker's subsequent requests (but not its  first). A 2nd/3rd/etc request means we can (most of the time) mark the task as complete, decrement the mapTasksWG as appropriate, and check for the entire job being complete
+	if args.CompletedTaskId != -1 {
 		for idx := range c.tasks {
 			task := &c.tasks[idx]
 			if task.Id == args.CompletedTaskId {
-				task.Status = completed
-				// the completion of a map task means we're one step closer to being able to run reduce tasks
-				if task.TaskType == mapTask {
-					c.mapTasksWg.Done()
+				// If the id of the worker making this rpc request is the one associated with this task, we mark the task complete & decrement the wg as appropriate
+				if task.currentWorker == args.WorkerId {
+					task.Status = completed
+					// the completion of a map task means we're one step closer to being able to run reduce tasks
+					if task.TaskType == mapTask {
+						c.mapTasksWg.Done()
+					}
+					break
 				}
-				break
+				// Otherwise this worker was previously assumed non-responsive, and its task reassigned.
+				// Don't let the original worker duplicate the wg decrement
 			}
 		}
 
@@ -169,76 +79,89 @@ func (c *Coordinator) RequestForAssignment(args *RequestForAssignmentArgs, reply
 			}
 		}
 		if allDone {
-			reply.NewTask = taskData{-1, noMoreTasks, "", completed}
+			reply.NewTask = taskData{-1, noMoreTasks, "", completed, time.Time{}, -1}
 			c.coordLock.Unlock()
 			return nil
 		}
 	}
 
-	// regardless of whether this is a 1st or subsequent request, get the next task
-	// Set reply.NewTask && the current worker within c.workers' currentTaskId
+	// For both 1st and subsequent requests, get the next task
 	nextTask := c.firstWaitingTask()
+	coordTaskPtr := c.getTaskById(nextTask.Id)
+	if coordTaskPtr != nil {
+		coordTaskPtr.currentWorker = args.WorkerId
+	}
 	if nextTask.TaskType == reduceTask {
-		//The wait here is problematic in the following scenario: last 3 map tasks are assigned -> (
-		//then) -> first of those is compelted, its worker asks for a new task (this function).
-		//This function locks the coord as its first step, calls Done on the WG,
-		//but that only brings its value down to 2. Then we wait here,
-		//and thus deadlock as we are waiting for others to call wg.Done, and they are waiting on us to unlock below
+		// TODO: does it make sense to have a field in coord that tracks whether we can proceed with reduceTasks? That would eliminate 1 unlock/lock cycle for each call of this function
 		c.coordLock.Unlock()
 		c.mapTasksWg.Wait()
 		c.coordLock.Lock()
 	}
 	reply.NewTask = nextTask
-	for idx := range c.workers {
-		worker := &c.workers[idx]
-		if worker.id == args.WorkerId {
-			worker.currentTaskId = nextTask.Id
-			break
-		}
-	}
 	c.coordLock.Unlock()
 	return nil
 }
 
-// We've got a new request, and it's a workers 2nd/3rd/etc request. Did any of c's workers last request something > 10 seconds ago?
-// Assumes data in c is locked/unlocked before/after this call
-func (c *Coordinator) handleTimeouts() {
-	var task *taskData
-	for i := range c.workers {
-		worker := &c.workers[i]
-		task = c.getTaskFromId(worker.currentTaskId)
-		if task.Id != -1 &&
-			task.Status != completed &&
-			time.Now().Nanosecond()-worker.nanoSecsAtLastRequest > (int)(time.Second*10) {
-
-			// then reclaim the task by resetting its status
-			task.Status = notYetStarted
-			// Also reset worker
-			worker.nanoSecsAtLastRequest = time.Now().Nanosecond()
-			worker.currentTaskId = -1
+func (c *Coordinator) firstWaitingTask() taskData {
+	// TODO: probably could separate map & reduce tasks in coord struct
+	// check maps first
+	for c.tasksOfTypeStillRunning(mapTask) {
+		for idx, _ := range c.tasks {
+			task := &c.tasks[idx]
+			// Do we have a (map) task that's either not yet started, or has been running for over 10 seconds?
+			if task.TaskType == mapTask &&
+				(task.Status == notYetStarted ||
+					(task.Status == inProgress &&
+						!task.startTime.IsZero() &&
+						time.Since(task.startTime) > time.Second*10)) {
+				//update the task's status & startTime in coordinator
+				task.Status = inProgress
+				task.startTime = time.Now()
+				return *task
+			}
 		}
+		// If a worker crashes before completing a task & reporting back, but fewer than 10 seconds have elapsed, other workers asking for that task will not be assigned the incomplete task, because the start time is < 10 seconds ago. To fix, sleep in while loop
+		c.coordLock.Unlock()
+		time.Sleep(time.Second)
+		c.coordLock.Lock()
 	}
-	//	It's necessary to sort whenever a timeout happens.
-	//
-	// For instance, say: map assigned -> reduce assigned -> map timesOut -> reduce cannot start until all maps are done
-	// ==> the wg should take care of most of this, but we could deadlock if:
-	// workers running map tasks timed out,
-	// then the map tasks were put in the back of the queue,
-	// then workers have been assigned reduce tasks,
-	// which are waiting for all map workers to complete
-
-	sort.Sort(ByType(c.tasks))
+	// now, same for reduce
+	for c.tasksOfTypeStillRunning(reduceTask) {
+		for idx, _ := range c.tasks {
+			task := &c.tasks[idx]
+			if task.TaskType == reduceTask &&
+				(task.Status == notYetStarted ||
+					(task.Status == inProgress && !task.startTime.IsZero() &&
+						time.Since(task.startTime) > time.Second*10)) {
+				task.Status = inProgress
+				task.startTime = time.Now()
+				return *task
+			}
+		}
+		c.coordLock.Unlock()
+		time.Sleep(time.Second)
+		c.coordLock.Lock()
+	}
+	return taskData{-1, noMoreTasks, "", completed, time.Time{}, -1}
 }
 
-func (c *Coordinator) firstWaitingTask() taskData {
-	for idx, taskCopy := range c.tasks {
-		taskPtr := &c.tasks[idx]
-		if taskCopy.Status == notYetStarted {
-			taskPtr.Status = inProgress
-			return taskCopy
+func (c *Coordinator) getTaskById(id int) *taskData {
+	for idx, _ := range c.tasks {
+		task := &c.tasks[idx]
+		if task.Id == id {
+			return task
 		}
 	}
-	return taskData{-1, noMoreTasks, "", completed}
+	return nil
+}
+
+func (c *Coordinator) tasksOfTypeStillRunning(taskType taskType) bool {
+	for _, task := range c.tasks {
+		if task.TaskType == taskType && task.Status != completed {
+			return true
+		}
+	}
+	return false
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -291,6 +214,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		task.TaskType = mapTask
 		task.Filename = file
 		task.Status = notYetStarted
+		task.currentWorker = -1
 		c.tasks = append(c.tasks, task)
 	}
 
@@ -304,10 +228,9 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		task.TaskType = reduceTask
 		task.Filename = "" // Reduce worker will gather intermediate files itself, based on its ID
 		task.Status = notYetStarted
+		task.currentWorker = -1
 		c.tasks = append(c.tasks, task)
 	}
-
-	c.workers = make([]workerData, 0)
 
 	c.server()
 	c.coordLock.Unlock()

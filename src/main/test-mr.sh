@@ -74,7 +74,7 @@ rm -f mr-*
 
 failed_any=0
 
-#########################################################
+#######################################################
 # first word-count
 
 # generate the correct output
@@ -113,7 +113,7 @@ fi
 # wait for remaining workers and coordinator to exit.
 wait
 
-#########################################################
+########################################################
 # now indexer
 rm -f mr-*
 
@@ -197,7 +197,7 @@ fi
 
 wait
 
-#########################################################
+########################################################
 echo '***' Starting job count test.
 
 rm -f mr-*
@@ -211,6 +211,7 @@ maybe_quiet $TIMEOUT ../mrworker ../../mrapps/jobcount.so &
 maybe_quiet $TIMEOUT ../mrworker ../../mrapps/jobcount.so
 
 NT=`cat mr-out* | awk '{print $2}'`
+echo "NT" $NT
 if [ "$NT" -eq "8" ]
 then
   echo '---' job count test: PASS
@@ -222,7 +223,7 @@ fi
 
 wait
 
-#########################################################
+#####################################################
 # test whether any worker or coordinator exits before the
 # task has completed (i.e., all output files have been finalized)
 rm -f mr-*
@@ -269,6 +270,7 @@ sort mr-out* | grep . > mr-wc-all-initial
 wait
 
 # compare initial and final outputs
+# No worker should exit successfully until the entire job is done
 sort mr-out* | grep . > mr-wc-all-final
 if cmp mr-wc-all-final mr-wc-all-initial
 then

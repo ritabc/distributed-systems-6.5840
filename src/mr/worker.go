@@ -63,10 +63,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		} else if nextTask.TaskType == reduceTask {
 			processReduceTask(reducef, nextTask.Id-nMapTasks)
 			reduceIdx++
-		} else if nextTask.TaskType == noMoreTasks {
-			os.Exit(0)
 		}
-
 		currentTaskId = nextTask.Id
 	}
 }
@@ -176,7 +173,7 @@ func processReduceTask(reducef func(string, []string) string, reduceTaskIdx int)
 		}
 	}
 
-	tmpOutputFile, err := os.CreateTemp("./", fmt.Sprintf("mr-out-%v-tmp", reduceTaskIdx))
+	tmpOutputFile, err := os.CreateTemp("./", fmt.Sprintf("mr-tmp-%v", reduceTaskIdx))
 	if err != nil {
 		fmt.Printf("cannot create %v.\n", tmpOutputFile)
 	}
@@ -219,6 +216,10 @@ func CallRequestForAssignment(workerId int, completedTaskId int, newTaskData *ta
 	*newTaskData = reply.NewTask
 	*nReduce = reply.NReduceTasks
 	*nMap = reply.NMapTasks
+
+	if newTaskData.TaskType == noMoreTasks {
+		return errors.New("no more tasks in this worker")
+	}
 
 	return nil
 }
