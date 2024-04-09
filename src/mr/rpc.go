@@ -17,7 +17,13 @@ type RequestForAssignmentArgs struct {
 }
 
 type RequestForAssignmentReply struct {
-	NewTask      taskData
+	NewTask taskData
+}
+
+type RequestForCountsArgs struct {
+}
+
+type RequestForCountsReply struct {
 	NReduceTasks int
 	NMapTasks    int
 }

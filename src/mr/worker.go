@@ -49,10 +49,12 @@ func Worker(mapf func(string, string) []KeyValue,
 		reduceIdx     int
 	)
 
+	CallGetCounts(&nReduceTasks, &nMapTasks)
+
 	currentTaskId = -1
 	for reduceIdx = 0; ; {
 		// To get a new task:
-		err = CallRequestForAssignment(pid, currentTaskId, &nextTask, &nReduceTasks, &nMapTasks)
+		err = CallRequestForAssignment(pid, currentTaskId, &nextTask)
 		if err != nil {
 			return
 		}
@@ -203,8 +205,7 @@ func processReduceTask(reducef func(string, []string) string, reduceTaskIdx int)
 
 }
 
-func CallRequestForAssignment(workerId int, completedTaskId int, newTaskData *taskData, nReduce *int,
-	nMap *int) error {
+func CallRequestForAssignment(workerId int, completedTaskId int, newTaskData *taskData) error {
 	args := RequestForAssignmentArgs{workerId, completedTaskId}
 
 	reply := RequestForAssignmentReply{}
@@ -214,12 +215,24 @@ func CallRequestForAssignment(workerId int, completedTaskId int, newTaskData *ta
 	}
 
 	*newTaskData = reply.NewTask
-	*nReduce = reply.NReduceTasks
-	*nMap = reply.NMapTasks
 
 	if newTaskData.TaskType == noMoreTasks {
 		return errors.New("no more tasks in this worker")
 	}
+
+	return nil
+}
+
+func CallGetCounts(nMapTasks *int, nReduceTasks *int) error {
+	args := RequestForCountsArgs{}
+	reply := RequestForCountsReply{}
+	ok := call("Coordinator.RequestForCounts", &args, &reply)
+	if !ok {
+		return errors.New("call for counts of map & reduce counts failed")
+	}
+
+	*nMapTasks = reply.NMapTasks
+	*nReduceTasks = reply.NReduceTasks
 
 	return nil
 }
