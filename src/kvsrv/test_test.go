@@ -5,6 +5,7 @@ import (
 	"6.5840/porcupine"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"math/rand"
 	"runtime"
 	"strconv"
@@ -431,175 +432,174 @@ func TestMemPut2(t *testing.T) {
 	cfg.end()
 }
 
-//func TestMemAppend2(t *testing.T) {
-//	const MEM = 10 // in MiB
-//
-//	cfg := make_config(t, false)
-//	defer cfg.cleanup()
-//
-//	cfg.begin("Test: memory use append")
-//
-//	ck0 := cfg.makeClient()
-//	ck1 := cfg.makeClient()
-//
-//	rdVal0 := randValue(MiB * MEM)
-//	ck0.Append("k", rdVal0)
-//	rdVal1 := randValue(MiB * MEM)
-//	ck1.Append("k", rdVal1)
-//
-//	runtime.GC()
-//	var st runtime.MemStats
-//	runtime.ReadMemStats(&st)
-//	m := st.HeapAlloc / MiB
-//	if m > 3*MEM {
-//		t.Fatalf("error: server using too much memory %d\n", m)
-//	}
-//	cfg.end()
-//}
+func TestMemAppend2(t *testing.T) {
+	const MEM = 10 // in MiB
 
-//func TestMemPutManyClients(t *testing.T) {
-//	const (
-//		NCLIENT = 100_000
-//		MEM     = 1000
-//	)
-//
-//	cfg := make_config(t, false)
-//	defer cfg.cleanup()
-//
-//	v := randValue(MEM)
-//
-//	cks := make([]*Clerk, NCLIENT)
-//	for i, _ := range cks {
-//		cks[i] = cfg.makeClient()
-//	}
-//
-//	// allow threads started by labrpc to start
-//	time.Sleep(1 * time.Second)
-//
-//	cfg.begin("Test: memory use many put clients")
-//
-//	runtime.GC()
-//	runtime.GC()
-//
-//	var st runtime.MemStats
-//	runtime.ReadMemStats(&st)
-//	m0 := st.HeapAlloc
-//
-//	for i := 0; i < NCLIENT; i++ {
-//		cks[i].Put("k", v)
-//	}
-//
-//	runtime.GC()
-//	time.Sleep(1 * time.Second)
-//	runtime.GC()
-//
-//	runtime.ReadMemStats(&st)
-//	m1 := st.HeapAlloc
-//	f := (float64(m1) - float64(m0)) / NCLIENT
-//	if m1 > m0+(NCLIENT*200) {
-//		t.Fatalf("error: server using too much memory %d %d (%.2f per client)\n", m0, m1, f)
-//	}
-//
-//	for _, ck := range cks {
-//		cfg.deleteClient(ck)
-//	}
-//
-//	cfg.end()
-//}
+	cfg := make_config(t, false)
+	defer cfg.cleanup()
 
-//
-//func TestMemGetManyClients(t *testing.T) {
-//	const (
-//		NCLIENT = 100_000
-//	)
-//
-//	cfg := make_config(t, false)
-//	defer cfg.cleanup()
-//
-//	cfg.begin("Test: memory use many get client")
-//
-//	ck := cfg.makeClient()
-//	ck.Put("0", "")
-//	cfg.deleteClient(ck)
-//
-//	cks := make([]*Clerk, NCLIENT)
-//	for i, _ := range cks {
-//		cks[i] = cfg.makeClient()
-//	}
-//
-//	// allow threads started by labrpc to start
-//	time.Sleep(1 * time.Second)
-//
-//	runtime.GC()
-//	runtime.GC()
-//
-//	var st runtime.MemStats
-//	runtime.ReadMemStats(&st)
-//	m0 := st.HeapAlloc
-//
-//	for i := 0; i < NCLIENT; i++ {
-//		cks[i].Get("0")
-//	}
-//
-//	runtime.GC()
-//
-//	time.Sleep(1 * time.Second)
-//
-//	runtime.GC()
-//
-//	runtime.ReadMemStats(&st)
-//	m1 := st.HeapAlloc
-//	f := (float64(m1) - float64(m0)) / NCLIENT
-//	if m1 >= m0+NCLIENT*10 {
-//		t.Fatalf("error: server using too much memory m0 %d m1 %d (%.2f per client)\n", m0, m1, f)
-//	}
-//
-//	for _, ck := range cks {
-//		cfg.deleteClient(ck)
-//	}
-//
-//	cfg.end()
-//}
-//
-//func TestMemManyAppends(t *testing.T) {
-//	const (
-//		N   = 1000
-//		MEM = 1000
-//	)
-//
-//	cfg := make_config(t, false)
-//	defer cfg.cleanup()
-//
-//	cfg.begin("Test: memory use many appends")
-//
-//	ck := cfg.makeClient()
-//	rdVal := randValue(MEM)
-//
-//	runtime.GC()
-//	runtime.GC()
-//
-//	var st runtime.MemStats
-//	runtime.ReadMemStats(&st)
-//	m0 := st.HeapAlloc
-//
-//	for i := 0; i < N; i++ {
-//		ck.Append("k", rdVal)
-//	}
-//
-//	runtime.GC()
-//
-//	time.Sleep(1 * time.Second)
-//
-//	runtime.GC()
-//
-//	runtime.ReadMemStats(&st)
-//	m1 := st.HeapAlloc
-//	if m1 >= 3*MEM*N {
-//		t.Fatalf("error: server using too much memory m0 %d m1 %d\n", m0, m1)
-//	}
-//
-//	log.Printf("m0 %d m1 %d\n", m0, m1)
-//
-//	cfg.deleteClient(ck)
-//	cfg.end()
-//}
+	cfg.begin("Test: memory use append")
+
+	ck0 := cfg.makeClient()
+	ck1 := cfg.makeClient()
+
+	rdVal0 := randValue(MiB * MEM)
+	ck0.Append("k", rdVal0)
+	rdVal1 := randValue(MiB * MEM)
+	ck1.Append("k", rdVal1)
+
+	runtime.GC()
+	var st runtime.MemStats
+	runtime.ReadMemStats(&st)
+	m := st.HeapAlloc / MiB
+	if m > 3*MEM {
+		t.Fatalf("error: server using too much memory %d\n", m)
+	}
+	cfg.end()
+}
+
+func TestMemPutManyClients(t *testing.T) {
+	const (
+		NCLIENT = 100_000
+		MEM     = 1000
+	)
+
+	cfg := make_config(t, false)
+	defer cfg.cleanup()
+
+	v := randValue(MEM)
+
+	cks := make([]*Clerk, NCLIENT)
+	for i, _ := range cks {
+		cks[i] = cfg.makeClient()
+	}
+
+	// allow threads started by labrpc to start
+	time.Sleep(1 * time.Second)
+
+	cfg.begin("Test: memory use many put clients")
+
+	runtime.GC()
+	runtime.GC()
+
+	var st runtime.MemStats
+	runtime.ReadMemStats(&st)
+	m0 := st.HeapAlloc
+
+	for i := 0; i < NCLIENT; i++ {
+		cks[i].Put("k", v)
+	}
+
+	runtime.GC()
+	time.Sleep(1 * time.Second)
+	runtime.GC()
+
+	runtime.ReadMemStats(&st)
+	m1 := st.HeapAlloc
+	f := (float64(m1) - float64(m0)) / NCLIENT
+	if m1 > m0+(NCLIENT*200) {
+		t.Fatalf("error: server using too much memory %d %d (%.2f per client)\n", m0, m1, f)
+	}
+
+	for _, ck := range cks {
+		cfg.deleteClient(ck)
+	}
+
+	cfg.end()
+}
+
+func TestMemGetManyClients(t *testing.T) {
+	const (
+		NCLIENT = 100_000
+	)
+
+	cfg := make_config(t, false)
+	defer cfg.cleanup()
+
+	cfg.begin("Test: memory use many get client")
+
+	ck := cfg.makeClient()
+	ck.Put("0", "")
+	cfg.deleteClient(ck)
+
+	cks := make([]*Clerk, NCLIENT)
+	for i, _ := range cks {
+		cks[i] = cfg.makeClient()
+	}
+
+	// allow threads started by labrpc to start
+	time.Sleep(1 * time.Second)
+
+	runtime.GC()
+	runtime.GC()
+
+	var st runtime.MemStats
+	runtime.ReadMemStats(&st)
+	m0 := st.HeapAlloc
+
+	for i := 0; i < NCLIENT; i++ {
+		cks[i].Get("0")
+	}
+
+	runtime.GC()
+
+	time.Sleep(1 * time.Second)
+
+	runtime.GC()
+
+	runtime.ReadMemStats(&st)
+	m1 := st.HeapAlloc
+	f := (float64(m1) - float64(m0)) / NCLIENT
+	if m1 >= m0+NCLIENT*10 {
+		t.Fatalf("error: server using too much memory m0 %d m1 %d (%.2f per client)\n", m0, m1, f)
+	}
+
+	for _, ck := range cks {
+		cfg.deleteClient(ck)
+	}
+
+	cfg.end()
+}
+
+func TestMemManyAppends(t *testing.T) {
+	const (
+		N   = 1000
+		MEM = 1000
+	)
+
+	cfg := make_config(t, false)
+	defer cfg.cleanup()
+
+	cfg.begin("Test: memory use many appends")
+
+	ck := cfg.makeClient()
+	rdVal := randValue(MEM)
+
+	runtime.GC()
+	runtime.GC()
+
+	var st runtime.MemStats
+	runtime.ReadMemStats(&st)
+	m0 := st.HeapAlloc
+
+	for i := 0; i < N; i++ {
+		ck.Append("k", rdVal)
+	}
+
+	runtime.GC()
+
+	time.Sleep(1 * time.Second)
+
+	runtime.GC()
+
+	runtime.ReadMemStats(&st)
+	m1 := st.HeapAlloc
+	if m1 >= 3*MEM*N {
+		t.Fatalf("error: server using too much memory m0 %d m1 %d\n", m0, m1)
+	}
+
+	log.Printf("m0 %d m1 %d\n", m0, m1)
+
+	cfg.deleteClient(ck)
+	cfg.end()
+}

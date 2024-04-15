@@ -44,8 +44,10 @@ func (ck *Clerk) Get(key string) string {
 
 	var reply GetReply
 
+	reqId := nrand()
+
 	for {
-		args := GetArgs{key, ck.clientId}
+		args := GetArgs{key, reqId, ck.clientId}
 		success := ck.server.Call("KVServer.Get", &args, &reply)
 		if success {
 			break
@@ -70,18 +72,23 @@ func (ck *Clerk) PutAppend(key string, value string, op string) string {
 		reply PutAppendReply
 	)
 
+	reqId := nrand()
+
 	if op == "Put" {
 		for {
-			args = PutAppendArgs{key, value, PutRequest, ck.clientId}
+			args = PutAppendArgs{key, value, PutRequest, reqId, ck.clientId}
 			success := ck.server.Call("KVServer.Put", &args, &reply)
 			if success {
 				break
 			}
 		}
 	} else if op == "Append" {
+		// save original value, before any appends happen.
+		// b/c if one append succeeds server-side, but the RPC fails to return,
+		// we'll repeat the RPC and don't want double appends
 		originalVal := ck.Get(key)
 		for {
-			args = PutAppendArgs{key, value, AppendRequest, ck.clientId}
+			args = PutAppendArgs{key, value, AppendRequest, reqId, ck.clientId}
 			success := ck.server.Call("KVServer.Append", &args, &reply)
 			if success {
 				break
