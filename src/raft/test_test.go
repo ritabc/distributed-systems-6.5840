@@ -97,6 +97,7 @@ func TestManyElections3A(t *testing.T) {
 
 	cfg.begin("Test (3A): multiple elections")
 
+	DPrintf("reachedA")
 	cfg.checkOneLeader()
 
 	iters := 10
@@ -111,6 +112,7 @@ func TestManyElections3A(t *testing.T) {
 
 		// either the current leader should still be alive,
 		// or the remaining four should elect a new one.
+		DPrintf("reachedB%v", ii)
 		cfg.checkOneLeader()
 
 		cfg.connect(i1)
@@ -118,6 +120,7 @@ func TestManyElections3A(t *testing.T) {
 		cfg.connect(i3)
 	}
 
+	DPrintf("reachedC")
 	cfg.checkOneLeader()
 
 	cfg.end()
