@@ -68,11 +68,11 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	state                   serverType
-	recentHeartbeatReceived bool
+	state                   serverType // needs locking
+	recentHeartbeatReceived bool       // needs locking
 
 	// TODO (3C) Must be updated into persister before responding to RPCs
-	currentTerm int // latest term this server has seen
+	currentTerm int // latest term this server has seen // needs locking
 	votedFor    int // candidateId that received vote of this server in current term (or -1 if none)
 }
 
@@ -156,19 +156,17 @@ type RequestVoteReply struct {
 // Executed by receiver when a vote is requested by args.CandidateId
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
+	// sender does not have lock here
+
 	// For the majority of this function to work, rf must be locked
 	// Then, it must return to unlocked state
-	// The sender holds its own lock
-	// If sending to ourself, no need to lock/unlock
-	// Else if sending to another node, receiver's lock is not held.
-	// first, lock receiving node. Then, unlock at end of this func
-
-	if args.CandidateId != rf.me {
-		rf.lockAndDebug("RequestVote from self")
-		defer rf.unlockAndDebug("RequestVote from self")
-	}
+	// The sender does not hold its own lock
+	// Regardless of receiving from self/other, we must lock/unlock
 
 	DPrintf("%v requests vote from %v", args.CandidateId, rf.me)
+
+	rf.lockAndDebug("RequestVote from self")
+	defer rf.unlockAndDebug("RequestVote from self")
 
 	// First, handle invalid RequestVote RPC
 	// Invalid if cand's term is lower than ours
@@ -183,8 +181,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Update our term, set reply.Term to it, record heartbeat and ourselves as a follower
 	rf.currentTerm = args.Term
 	reply.Term = rf.currentTerm
-	DPrintf("[%v] records heartbeat in valid RV RPC from %v", rf.me, args.CandidateId)
-	rf.recentHeartbeatReceived = true
 	if rf.me != args.CandidateId {
 		// Unless we're voting for ourself (in which case we'd like to remain a cand), downgrade to follower
 		DPrintf("[%v] downgrade to follower - caller (%v) has higher (or ==) term than ours. State: %v -> follower", rf.me, args.CandidateId, rf.state)
@@ -194,6 +190,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Next, vote as appropriate
 	// TODO: (3B) Add AND: and candidate's log is at least as up-to-date as receiver's log
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		DPrintf("[%v] records heartbeat on vote cast", rf.me)
+		rf.recentHeartbeatReceived = true
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		DPrintf("[%v] grants vote to %v", rf.me, args.CandidateId)
@@ -247,17 +245,15 @@ type AppendEntriesReply struct {
 
 // Handler for recipient of an AppendEntries RPC call
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// Sender's lock not held
+
 	// For the majority of this function to work, rf must be locked
 	// Then, it must return to unlocked state
-	// The sender holds its own lock
-	// If sending to ourself, no need to lock/unlock
-	// Else if sending to another node, receiver's lock is not held.
-	// first, lock receiving node. Then, unlock at end of this func
+	// The sender does not hold its own lock
+	// Regardless of sending from self/other, receiver must lock/unlock
 
-	if args.LeaderId != rf.me {
-		rf.lockAndDebug("AppendEntries")
-		defer rf.unlockAndDebug("AppendEntries")
-	}
+	rf.lockAndDebug("AppendEntries")
+	defer rf.unlockAndDebug("AppendEntries")
 
 	// First, handle invalid AppendEntries RPC
 	if args.Term < rf.currentTerm {
@@ -269,7 +265,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Otherwise, RPC requester is seen as leader, as it's term is >= ours
 	// Update our term, set reply.Term to it, record heartbeat and ourself as a follower
-	DPrintf("data race? args.LeaderId: %v, rf.me: %v", args.LeaderId, rf.me)
 	rf.currentTerm = args.Term
 	reply.Term = rf.currentTerm
 	DPrintf("[%v] records heartbeat: valid AE RPC from leader %v received", rf.me, args.LeaderId)
@@ -334,37 +329,37 @@ func (rf *Raft) ticker() {
 	// electionTimeout should be between 800 & 1200 ms
 	electionTimeout := 800 + (rand.Int63() % 400)
 
-	rf.lockAndDebug("ticker")
-	defer rf.unlockAndDebug("ticker")
-	for rf.killed() == false {
+	for !rf.killed() {
 		// As a follower, should I become a candidate?
 
 		// start the timeout with no recentHeartbeat received
+		rf.lockAndDebug("ticker")
 		rf.recentHeartbeatReceived = false
+		rf.unlockAndDebug("ticker")
 
-		rf.unlockAndDebug("ticker, around timeout")
 		time.Sleep(time.Duration(electionTimeout) * time.Millisecond)
-		rf.lockAndDebug("ticker, around timeout")
 
-		// If we're a follower, and we haven't voted for anyone (but have received a heartbeat recently), should we still start the election?
-		// Does the following make more sense?:
-		// if we're a follower, and we've already voted for someone (but maybe we've received a heartbeat recently)
-		if (rf.state == followerNode && (!rf.recentHeartbeatReceived || rf.votedFor == -1)) ||
-			(rf.state == candidateNode && !rf.recentHeartbeatReceived) {
+		rf.lockAndDebug("ticker, before check for timeout")
+		if !rf.recentHeartbeatReceived && (rf.state == followerNode || rf.state == candidateNode) {
 			DPrintf("[%v] timed out while waiting for heartbeat (votes granted, valid incoming RPCs)", rf.me)
-			DPrintf("state: %v, !rf.recentHeartbeatReceived: %v, rf.votedFor == -1? %v", rf.state, !rf.recentHeartbeatReceived, rf.votedFor == -1)
+			DPrintf("state: %v, !rf.recentHeartbeatReceived: %v", rf.state, !rf.recentHeartbeatReceived)
 			rf.state = candidateNode
-			rf.votedFor = -1
+			rf.unlockAndDebug("ticker, before election")
 			rf.startElection()
+			rf.lockAndDebug("ticker, after election")
 		}
+		rf.unlockAndDebug("ticker, after check for timeout (and poss. election)")
 	}
 }
 
-// called by a candidate rf server, holding lock
+// called by a candidate rf server. lock not held
 func (rf *Raft) startElection() {
 	DPrintf("[%v] starting election", rf.me)
 
+	rf.lockAndDebug("beg. of startElection")
 	rf.currentTerm++
+	rf.recentHeartbeatReceived = false
+	rf.unlockAndDebug("beg. of startElection")
 
 	//rf.votedFor = rf.me
 	yesVotes := 0
@@ -372,29 +367,23 @@ func (rf *Raft) startElection() {
 	var voteMutex sync.Mutex
 	cond := sync.NewCond(&voteMutex) // TODO Should this be on existing mutex? I don't think so?
 
-	rf.recentHeartbeatReceived = false
-
 	// Spawn len(rf.peers) goroutines, that each request a vote from a different node
 	for i := 0; i < len(rf.peers); i++ {
 		go func(nodeIdx int) {
+			DPrintf("[%v] requesting vote from %v", rf.me, nodeIdx)
 
-			// TODO Lock then unlock. Always? Never? Sometimes? Also, where?
-			// not here & always, because 3 goroutines will lock the same rf
-			// what about not here, not anywhere in this function? No - we get race condition after rf.sendRequestVote() (with AppendEntries - maybe the issue is there?)
-			//rf.lockAndDebug("startElection goroutine")
-			//defer rf.unlockAndDebug("startElection goroutine")
-
-			DPrintf("[%v] requesting vote from idx %v", rf.me, nodeIdx)
-
+			rf.lockAndDebug("startElection, goroutine")
 			var reply RequestVoteReply
 			args := RequestVoteArgs{rf.currentTerm, rf.me}
+			rf.unlockAndDebug("startElection, goroutine")
 
-			// sender always has lock here - verified
+			// Sender (rf) does not hold lock here
 			rf.sendRequestVote(nodeIdx, &args, &reply)
 
 			voteMutex.Lock()
 			defer voteMutex.Unlock()
 
+			rf.lockAndDebug("startElection, goroutine after RPC")
 			// if RPC recipient's term is higher than this candidate's term, this cand --> becomes a follower
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
@@ -402,6 +391,7 @@ func (rf *Raft) startElection() {
 			} else if reply.VoteGranted {
 				yesVotes++
 			}
+			rf.unlockAndDebug("startElection, goroutine after RPC")
 
 			voteCount++
 			cond.Broadcast()
@@ -417,17 +407,21 @@ func (rf *Raft) startElection() {
 	}
 
 	if yesVotes >= majority {
-		DPrintf("[%v] received %v (enough) votes", rf.me, yesVotes)
+		DPrintf("[%v] received %v (enough) yes votes", rf.me, yesVotes)
+		rf.lockAndDebug("startElection, during promotion to leader")
 		rf.state = leaderNode
+		rf.unlockAndDebug("startElection, during promotion to leader")
+		// Sender (rf) does not hold lock here
 		rf.sendHeartbeatsToAllNodes()
 	} else {
-		DPrintf("[%v] only received %v votes (not enough)", rf.me, yesVotes)
+		DPrintf("[%v] only received %v yes votes (not enough)", rf.me, yesVotes)
 	}
 
 	voteMutex.Unlock()
 }
 
-// Only called by leaders, lock will be held already on call
+// Only called by leaders
+// rf's lock should not be held at time of this call
 // TODO: incorporate the 'idle' factor into this. Should only send when (leader? is) idle
 func (rf *Raft) sendHeartbeatsToAllNodes() {
 	// Can send 10 RPCs a second, about 1 every 100 seconds
@@ -442,34 +436,32 @@ func (rf *Raft) sendHeartbeatsToAllNodes() {
 }
 
 // periodically send heartbeat, process response, wait, repeat while not killed
+// rf's lock not held when called
 func (rf *Raft) sendHeartbeatToNode(nodeIdx int, timeBetweenHeartbeats int64) {
-	//// TODO: this block should not be here?
-	//rf.lockAndDebug("sendHBToNode")
-	//defer rf.unlockAndDebug("sendHBToNode")
-
 	for !rf.killed() {
+		rf.lockAndDebug("sendHBToNode")
 		var reply AppendEntriesReply
 		args := AppendEntriesArgs{rf.currentTerm, rf.me}
+		rf.unlockAndDebug("sendHBToNode")
+
 		DPrintf("[%v] sends heartbeat to %v", rf.me, nodeIdx)
 
-		// TODO rf has lock currently? Wih above commented out, we don't hold the lock
-		//rf.unlockAndDebug("sendHBToNode, before sendAE")
+		// Sender (rf)'s lock not held
 		rf.sendAppendEntries(nodeIdx, &args, &reply)
-		//rf.lockAndDebug("sendHBToNode, after sendAE")
 
 		// RPC response
 		// follower's term is higher than (this) the leader's term?
 		// args.Term < receiver's currentTerm
 		if !reply.Success {
-			DPrintf("[%v] AE RPC call to idx %v unsuccessfull. [%v] being downgraded from %v to follower", rf.me, nodeIdx, rf.me, rf.state)
+			rf.lockAndDebug("sendHBToNode, not success")
+			DPrintf("[%v] AE RPC call to %v unsuccessfull. [%v] being downgraded from %v to follower", rf.me, nodeIdx, rf.me, rf.state)
 			rf.currentTerm = reply.Term
 			rf.state = followerNode
+			rf.unlockAndDebug("sendHBToNode, not success")
 			return
 		}
 
-		rf.unlockAndDebug("sendHBToNode, before timeout")
 		time.Sleep(time.Duration(timeBetweenHeartbeats) * time.Millisecond)
-		rf.lockAndDebug("sendHBToNode, after timeout")
 	}
 }
 
