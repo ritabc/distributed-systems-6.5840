@@ -91,6 +91,7 @@ func (rf *Raft) unlockAndDebug(ctx string) {
 func (rf *Raft) GetState() (int, bool) {
 	rf.lockAndDebug("GetState")
 	defer rf.unlockAndDebug("GetState")
+	//DPrintf("[%v] in GetState function, state: %v", rf.me, rf.state)
 	return rf.currentTerm, rf.state == leaderNode
 }
 
@@ -163,37 +164,52 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// The sender does not hold its own lock
 	// Regardless of receiving from self/other, we must lock/unlock
 
-	DPrintf("%v requests vote from %v", args.CandidateId, rf.me)
+	DPrintf("[%v] receives requests vote from %v", rf.me, args.CandidateId)
 
-	rf.lockAndDebug("RequestVote from self")
-	defer rf.unlockAndDebug("RequestVote from self")
+	rf.lockAndDebug("RequestVote")
+	defer rf.unlockAndDebug("RequestVote")
+
+	if rf.me == args.CandidateId {
+		//DPrintf("[%v] receives vote request from self. args.Term: %v rf.currentTerm: %v rf.votedFor (atm): %v", rf.me, args.Term, rf.currentTerm, rf.votedFor)
+	}
 
 	// First, handle invalid RequestVote RPC
 	// Invalid if cand's term is lower than ours
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-		DPrintf("[%v] not voting for candidate %v because cand's term < [%v]'s term", rf.me, args.CandidateId, rf.me)
+		DPrintf("[%v] not voting for candidate %v because cand's term (%v) < [%v]'s term (%v)", rf.me, args.CandidateId, args.Term, rf.me, rf.currentTerm)
 		return
 	}
 
 	// Otherwise, candidate (aka RPC requester)'s term is >= ours
-	// Update our term, set reply.Term to it, record heartbeat and ourselves as a follower
+
+	// if requester's term is higher, reset votedFor
+	if args.Term > rf.currentTerm {
+		rf.votedFor = -1
+	}
+
+	// Update our term, set reply.Term to it
+	//DPrintf("[%v] changing currentTerm in RV handler: %v -> %v", rf.me, rf.currentTerm, args.Term)
 	rf.currentTerm = args.Term
 	reply.Term = rf.currentTerm
-	if rf.me != args.CandidateId {
-		// Unless we're voting for ourself (in which case we'd like to remain a cand), downgrade to follower
-		DPrintf("[%v] downgrade to follower - caller (%v) has higher (or ==) term than ours. State: %v -> follower", rf.me, args.CandidateId, rf.state)
-		rf.state = followerNode
-	}
 
 	// Next, vote as appropriate
 	// TODO: (3B) Add AND: and candidate's log is at least as up-to-date as receiver's log
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		DPrintf("[%v] records heartbeat on vote cast", rf.me)
+		// record HB iff we vote
+		DPrintf("[%v] records heartbeat on vote cast for %v", rf.me, args.CandidateId)
 		rf.recentHeartbeatReceived = true
+
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
+
+		// If we're voting yes for another (not self) node, downgrade self to follower
+		if rf.me != args.CandidateId {
+			DPrintf("[%v] downgraded to follower - casting vote for cand %v. State: %v -> follower", rf.me, args.CandidateId, rf.state)
+			rf.state = followerNode
+		}
+
 		DPrintf("[%v] grants vote to %v", rf.me, args.CandidateId)
 	}
 }
@@ -255,16 +271,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.lockAndDebug("AppendEntries")
 	defer rf.unlockAndDebug("AppendEntries")
 
+	//DPrintf("[%v] handling AE RPC from %v. args.Term: %v rf.currentTerm: %v", rf.me, args.LeaderId, args.Term, rf.currentTerm)
+
 	// First, handle invalid AppendEntries RPC
+	// if sender's term is less than receiver's, fail and set reply.Term = the higher receiver's
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		DPrintf("[%v] reply to AppendEntries RPC call is unsuccessful because caller (%v)'s term < [%v]'s term", rf.me, args.LeaderId, rf.me)
+		DPrintf("[%v] AppendEntries RPC call is unsuccessful because caller (%v)'s term < [%v]'s term", rf.me, args.LeaderId, rf.me)
+		DPrintf("[%v] Sender's term will become equivalent to ours %v", rf.me, rf.currentTerm)
 		return
 	}
 
 	// Otherwise, RPC requester is seen as leader, as it's term is >= ours
-	// Update our term, set reply.Term to it, record heartbeat and ourself as a follower
+	// Update our term, set reply.Term to it, record heartbeat and make ourself a follower
+	//DPrintf("[%v] changing currentTerm in AE handler: %v -> %v", rf.me, rf.currentTerm, args.Term)
 	rf.currentTerm = args.Term
 	reply.Term = rf.currentTerm
 	DPrintf("[%v] records heartbeat: valid AE RPC from leader %v received", rf.me, args.LeaderId)
@@ -334,6 +355,7 @@ func (rf *Raft) ticker() {
 
 		// start the timeout with no recentHeartbeat received
 		rf.lockAndDebug("ticker")
+		DPrintf("[%v] resetting heartbeat timer in ticker", rf.me)
 		rf.recentHeartbeatReceived = false
 		rf.unlockAndDebug("ticker")
 
@@ -357,11 +379,13 @@ func (rf *Raft) startElection() {
 	DPrintf("[%v] starting election", rf.me)
 
 	rf.lockAndDebug("beg. of startElection")
+	//DPrintf("[%v] incrementing currentTerm in startElection: %v -> %v", rf.me, rf.currentTerm, rf.currentTerm+1)
 	rf.currentTerm++
+	DPrintf("[%v] resetting heartbeat timer in startELection", rf.me)
 	rf.recentHeartbeatReceived = false
 	rf.unlockAndDebug("beg. of startElection")
 
-	//rf.votedFor = rf.me
+	rf.votedFor = rf.me
 	yesVotes := 0
 	voteCount := 0
 	var voteMutex sync.Mutex
@@ -370,31 +394,52 @@ func (rf *Raft) startElection() {
 	// Spawn len(rf.peers) goroutines, that each request a vote from a different node
 	for i := 0; i < len(rf.peers); i++ {
 		go func(nodeIdx int) {
-			DPrintf("[%v] requesting vote from %v", rf.me, nodeIdx)
+			DPrintf("[%v] about to request vote from %v", rf.me, nodeIdx)
+			// Loop till we make a successful RPC requestVote call and get either a yes or no vote
+			for !rf.killed() {
+				DPrintf("[%v] requesting vote from %v", rf.me, nodeIdx)
 
-			rf.lockAndDebug("startElection, goroutine")
-			var reply RequestVoteReply
-			args := RequestVoteArgs{rf.currentTerm, rf.me}
-			rf.unlockAndDebug("startElection, goroutine")
+				rf.lockAndDebug("startElection, goroutine")
+				var reply RequestVoteReply
+				args := RequestVoteArgs{rf.currentTerm, rf.me}
+				rf.unlockAndDebug("startElection, goroutine")
 
-			// Sender (rf) does not hold lock here
-			rf.sendRequestVote(nodeIdx, &args, &reply)
+				// Sender (rf) does not hold lock here
+				rpcOk := rf.sendRequestVote(nodeIdx, &args, &reply)
 
-			voteMutex.Lock()
-			defer voteMutex.Unlock()
+				DPrintf("[%v] RV RPC call to %v: %v A", rf.me, nodeIdx, rpcOk)
 
-			rf.lockAndDebug("startElection, goroutine after RPC")
-			// if RPC recipient's term is higher than this candidate's term, this cand --> becomes a follower
-			if reply.Term > rf.currentTerm {
-				rf.currentTerm = reply.Term
-				rf.state = followerNode
-			} else if reply.VoteGranted {
-				yesVotes++
+				voteMutex.Lock()
+				defer voteMutex.Unlock()
+
+				// 2 outcomes for RPC call:
+				// 1. success, receive either yes or no vote
+				// 2. RPC did not go through. If this is because follower is down, we should retry later so it has a chance to come back up
+				//// What if our connection is down? Still don't demote to follower until we demote self to follower
+				DPrintf("[%v] RV RPC call to %v: %v B", rf.me, nodeIdx, rpcOk)
+
+				if rpcOk {
+					DPrintf("[%v] called RequestVote RPC successfully to %v", rf.me, nodeIdx)
+					rf.lockAndDebug("startElection, goroutine after RPC")
+					// if RPC recipient's term is higher than this candidate's term, this cand --> becomes a follower
+					if reply.Term > rf.currentTerm {
+						DPrintf("[%v] changing currentTerm in startElection goroutine: %v -> %v", rf.me, rf.currentTerm, reply.Term)
+						rf.currentTerm = reply.Term
+						rf.state = followerNode
+					} else if reply.VoteGranted {
+						DPrintf("[%v] received vote from %v", rf.me, args.CandidateId)
+						yesVotes++
+					}
+					rf.unlockAndDebug("startElection, goroutine after RPC")
+
+					voteCount++
+					cond.Broadcast()
+					DPrintf("[%v] returning from startElection goroutine after receiving vote from %v", rf.me, nodeIdx)
+					return
+				} else {
+					DPrintf("[%v] sendRequestVote RPC to %v failed. Retrying", rf.me, nodeIdx)
+				}
 			}
-			rf.unlockAndDebug("startElection, goroutine after RPC")
-
-			voteCount++
-			cond.Broadcast()
 		}(i)
 	}
 
@@ -403,11 +448,12 @@ func (rf *Raft) startElection() {
 	majority := len(rf.peers)/2 + 1
 
 	for yesVotes < majority && voteCount != len(rf.peers) {
+		DPrintf("[%v] hasn't yet received enough votes. waiting", rf.me)
 		cond.Wait()
 	}
 
 	if yesVotes >= majority {
-		DPrintf("[%v] received %v (enough) yes votes", rf.me, yesVotes)
+		DPrintf("[%v] received %v (enough) yes votes. Promoting from %v (1?) -> 0", rf.me, yesVotes, rf.state)
 		rf.lockAndDebug("startElection, during promotion to leader")
 		rf.state = leaderNode
 		rf.unlockAndDebug("startElection, during promotion to leader")
@@ -444,17 +490,23 @@ func (rf *Raft) sendHeartbeatToNode(nodeIdx int, timeBetweenHeartbeats int64) {
 		args := AppendEntriesArgs{rf.currentTerm, rf.me}
 		rf.unlockAndDebug("sendHBToNode")
 
-		DPrintf("[%v] sends heartbeat to %v", rf.me, nodeIdx)
+		//DPrintf("[%v] sends heartbeat to %v", rf.me, nodeIdx)
 
 		// Sender (rf)'s lock not held
-		rf.sendAppendEntries(nodeIdx, &args, &reply)
+		rpcOk := rf.sendAppendEntries(nodeIdx, &args, &reply)
 
-		// RPC response
-		// follower's term is higher than (this) the leader's term?
-		// args.Term < receiver's currentTerm
-		if !reply.Success {
+		if !rpcOk {
+			// on network failure, downgrade leader to follower, stop sending heartbeats
+			rf.lockAndDebug("")
+			DPrintf("[%v] AE RPC to %v failed - network failure", rf.me, nodeIdx)
+			rf.state = followerNode
+			rf.unlockAndDebug("")
+			return
+		} else if !reply.Success {
+			// if RPC goes through but reply.Success? is a fail, that means sender's term was less than receivers. stop sending heartbeats
 			rf.lockAndDebug("sendHBToNode, not success")
 			DPrintf("[%v] AE RPC call to %v unsuccessfull. [%v] being downgraded from %v to follower", rf.me, nodeIdx, rf.me, rf.state)
+			//DPrintf("[%v] changing currentTerm in sendHBToNode: %v -> %v", rf.me, rf.currentTerm, reply.Term)
 			rf.currentTerm = reply.Term
 			rf.state = followerNode
 			rf.unlockAndDebug("sendHBToNode, not success")
