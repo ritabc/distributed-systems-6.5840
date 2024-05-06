@@ -318,11 +318,14 @@ func (rf *Raft) killed() bool {
 
 // A ticker function that handlers the election process
 func (rf *Raft) ticker() {
-	// electionTimeout will be between 800 & 1200 ms
-	timeoutInterval := 800 + (rand.Int63() % 400)
 
 	// Exit when killed
 	for !rf.killed() {
+
+		// Choose new electionTimeout interval each period so an unlucky set of choices don't haunt us for whole life of node
+		// electionTimeout will be between 800 & 1200 ms
+		timeoutInterval := 800 + (rand.Int63() % 400)
+
 		// First wait, then switch
 		time.Sleep(time.Duration(timeoutInterval) * time.Millisecond)
 
@@ -363,7 +366,7 @@ func (rf *Raft) startElection() {
 	rf.recentHeartbeatReceived = false
 	rf.mu.Unlock()
 
-	rf.votedFor = rf.me
+	//rf.votedFor = rf.me
 	yesVotes := 0
 	voteCount := 0
 	var voteMutex sync.Mutex
@@ -371,44 +374,48 @@ func (rf *Raft) startElection() {
 
 	// Spawn len(rf.peers) goroutines, that each request a vote from a different node
 	for i := 0; i < len(rf.peers); i++ {
-		go func(nodeIdx int) {
-			// Loop till we make a successful RPC requestVote call and get either a yes or no vote
-			for !rf.killed() {
+		if i == rf.me {
+			rf.votedFor = rf.me
+			yesVotes++
+		} else {
+			go func(nodeIdx int) {
+				// Loop till we make a successful RPC requestVote call and get either a yes or no vote
+				for !rf.killed() {
 
-				rf.mu.Lock()
-				var reply RequestVoteReply
-				args := RequestVoteArgs{rf.currentTerm, rf.me}
-				rf.mu.Unlock()
-
-				// Sender (rf) does not hold lock here
-				rpcOk := rf.sendRequestVote(nodeIdx, &args, &reply)
-
-				voteMutex.Lock()
-				defer voteMutex.Unlock()
-
-				// 2 outcomes for RPC call:
-				// 1. success, receive either yes or no vote
-				// 2. RPC did not go through. If this is because follower is down, we should retry later so it has a chance to come back up
-				//// What if our connection is down? Still don't demote to follower until we demote self to follower
-
-				if rpcOk {
 					rf.mu.Lock()
-					// if RPC recipient's term is higher than this candidate's term, this cand --> becomes a follower
-					if reply.Term > rf.currentTerm {
-						rf.currentTerm = reply.Term
-						rf.state = followerNode
-					} else if reply.VoteGranted {
-						yesVotes++
-					}
+					var reply RequestVoteReply
+					args := RequestVoteArgs{rf.currentTerm, rf.me}
 					rf.mu.Unlock()
 
-					voteCount++
-					cond.Broadcast()
-					return
-				} else {
+					// Sender (rf) does not hold lock here
+					rpcOk := rf.sendRequestVote(nodeIdx, &args, &reply)
+
+					voteMutex.Lock()
+					defer voteMutex.Unlock()
+
+					// 2 outcomes for RPC call:
+					// 1. success, receive either yes or no vote
+					// 2. RPC did not go through. If this is because follower is down, we should retry later so it has a chance to come back up
+					//// What if our connection is down? Still don't demote to follower until we demote self to follower
+
+					if rpcOk {
+						rf.mu.Lock()
+						// if RPC recipient's term is higher than this candidate's term, this cand --> becomes a follower
+						if reply.Term > rf.currentTerm {
+							rf.currentTerm = reply.Term
+							rf.state = followerNode
+						} else if reply.VoteGranted {
+							yesVotes++
+						}
+						rf.mu.Unlock()
+
+						voteCount++
+						cond.Broadcast()
+						return
+					}
 				}
-			}
-		}(i)
+			}(i)
+		}
 	}
 
 	voteMutex.Lock()
