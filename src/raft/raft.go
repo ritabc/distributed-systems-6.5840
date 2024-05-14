@@ -57,6 +57,11 @@ const (
 	followerNode
 )
 
+type entry struct {
+	Cmd  interface{}
+	Term int // term when entry was received by leader
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -64,16 +69,27 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg
 
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+
+	// Volatile state for each server
 	state                   serverType // needs locking
 	recentHeartbeatReceived bool       // needs locking
+	commitIndex             int        // index of highest log entry known to be committed // TODO: needs locking?
+	lastApplied             int        // index of highest log entry executed // TODO: needs locking?
+
+	// Volatile state applicable to leaders
+	nextIdx  []int // for each server (or follower?), idx of next log entry to send to it
+	matchIdx []int // for each server (follower?), idx of highest log entry known to be replicated on server
 
 	// TODO (3C) Must be updated into persister before responding to RPCs
-	currentTerm int // latest term this server has seen // needs locking
-	votedFor    int // candidateId that received vote of this server in current term (or -1 if none)
+	currentTerm int      // latest term this server has seen // needs locking
+	votedFor    int      // candidateId that received vote of this server in current term (or -1 if none)
+	log         []*entry // needs locking?
+
 }
 
 // return currentTerm and whether this server
@@ -134,12 +150,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 type RequestVoteArgs struct {
 	Term        int
 	CandidateId int
-	// Your data here (3B).
+	LastLogIdx  int // idx of candidate's last log entry
+	LastLogTerm int // term of candidate's last log entry
 }
 
 type RequestVoteReply struct {
 	Term        int
 	VoteGranted bool
+	LastLogIdx  int // index of last entry in voter's log
 }
 
 // RequestVote RPC handler.
@@ -156,15 +174,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	//DPrintf("[%v] (foll) received RequestVote from %v (cand)", rf.me, args.CandidateId)
+
 	// First, handle invalid RequestVote RPC
 	// Invalid if cand's term is lower than ours
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		reply.LastLogIdx = rf.lastLogIdx()
 		return
 	}
 
 	// Otherwise, candidate (aka RPC requester)'s term is >= ours
+
+	// But still,
 
 	// if requester's term is higher, reset votedFor
 	if args.Term > rf.currentTerm {
@@ -177,7 +200,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// Next, vote as appropriate
 	// TODO: (3B) Add AND: and candidate's log is at least as up-to-date as receiver's log
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.isCandLogAtLeastAsUpToDateAsVoters(args.LastLogTerm, args.LastLogIdx) {
 		// record HB iff we vote
 		rf.recentHeartbeatReceived = true
 
@@ -188,7 +211,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if rf.me != args.CandidateId {
 			rf.state = followerNode
 		}
+		reply.LastLogIdx = rf.lastLogIdx()
 	}
+}
+
+// For a yes vote, the candidate's log must also be at least as up to date as the voters
+// called with lock held
+func (rf *Raft) isCandLogAtLeastAsUpToDateAsVoters(lastLogTermCand int, lastLogIdxCand int) bool {
+	// When comparing two logs, up-to-date is defined as:
+	// if the last entries of each log have different terms, then the log w a later term is more up to date
+	// if they have the same term, the longer log is more up to date
+
+	var ret bool
+	lastLogTermMe := rf.log[rf.lastLogIdx()].Term
+
+	if lastLogTermCand != lastLogTermMe {
+		ret = lastLogTermCand >= lastLogTermMe
+		//DPrintf("[%v] has determined that it's %v that the candidate is at least as up to date as us (different terms)", rf.me, ret)
+	} else {
+		ret = lastLogIdxCand+1 >= len(rf.log)
+		//DPrintf("[%v] has determined that it's %v that the candidate is at least as up to date as us (same terms)", rf.me, ret)
+	}
+	return ret
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -224,35 +268,39 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 type AppendEntriesArgs struct {
-	Term     int // leaders term
-	LeaderId int // so follower can redirect clients
-
-	// Your code for 3B here
+	Term         int // leaders term
+	LeaderId     int // so follower can redirect clients
+	PrevLogIdx   int // idx of log entry immediately preceding new ones (those being sent)
+	PrevLogTerm  int // term of prevLogIdx entry
+	Entries      []*entry
+	LeaderCommit int // leader's commitIdx
 }
 
 type AppendEntriesReply struct {
-	Term    int  // currentTerm - used by leader to update its term & to step down if reply.Term > args.Term // TODO OR >= ?
+	Term    int  // currentTerm - used by leader to update its term & to step down if args.Term < reply.Term
 	Success bool // true if follower contained entry matching requester's prevLog, false otherwise
 	// Your code for 3B here
 }
 
 // Handler for recipient of an AppendEntries RPC call
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// Sender's lock not held
-
-	// For the majority of this function to work, rf must be locked
-	// Then, it must return to unlocked state
-	// The sender does not hold its own lock
-	// Regardless of sending from self/other, receiver must lock/unlock
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	DPrintf("[%v] received AE RPC from %v. Current len: %v", rf.me, args.LeaderId, len(rf.log))
 	// First, handle invalid AppendEntries RPC
 	// if sender's term is less than receiver's, fail and set reply.Term = the higher receiver's
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		DPrintf("[%v] (follower) returning early from AE handler b/c leader's term is less than our own", rf.me)
+		return
+	}
+	// Fail if log doesn't contain an entry at prevLogIdx with term == prevLogTerm
+	// First check args.PrevLogIdx are between -1 TODO: & rf.log len (remove?)
+	if args.PrevLogIdx > -1 && /*args.PrevLogIdx < len(rf.log) &&*/ rf.log[args.PrevLogIdx].Term != args.PrevLogTerm {
+		reply.Success = false
+		DPrintf("[%v] (follower) returning early from AE handler b/c the term of the entry at prevLogIdx %v does not match the leader's prevLogTerm (%v)", rf.me, args.PrevLogIdx, args.PrevLogTerm)
 		return
 	}
 
@@ -261,13 +309,67 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.currentTerm = args.Term
 	reply.Term = rf.currentTerm
 	rf.recentHeartbeatReceived = true
-	if rf.me != args.LeaderId {
+	if rf.me != args.LeaderId { // in theory we should not receive need to handle this call from self, but check just in case
 		// Unless we're sending to ourself (in which case we'd like to remain the leader), update our state to follower
 		rf.state = followerNode
 	}
 
-	// TODO: do 3B stuff
+	// At this point, if we were going to reject the new entries, we would have already
 	reply.Success = true
+
+	// Since our log is now equivalent to the leaders
+	// Learn from leader which entries in our newly updated log have been committed
+	// Do this on actual AE's && HB's
+	if args.LeaderCommit > rf.commitIndex {
+		DPrintf("[%v], a follower whose commitIdx is being updated. from %v to min(%v, %v)", rf.me, rf.commitIndex, args.LeaderCommit, rf.lastLogIdx())
+		rf.commitIndex = min(args.LeaderCommit, rf.lastLogIdx())
+	}
+
+	// If there were no entries, this was strictly a HB RPC - return
+	if len(args.Entries) == 0 {
+		DPrintf("[%v] received HB, not actual AE RPC", rf.me)
+		DPrintf("[%v] commitIdx: %v", rf.me, rf.commitIndex)
+		return
+	}
+
+	// Remove any entries that overlap in idx but have a different term
+	// First, check for overlap. If there is any, find the first entry which has unequal terms
+	// If equal idx's but unequal terms are found, delete that first term and all following
+	if args.PrevLogIdx < len(rf.log)-1 {
+		DPrintf("[%v] (follower) has logs past leader's PrevLogIdx (%v). len of follower's logs: %v", rf.me, args.PrevLogIdx, len(rf.log))
+		// there's overlap - do any of the entries with overlapping idexes have different terms, and thus need to be deleted?
+		for i := 0; i < len(args.Entries); i++ {
+			follIdx := args.PrevLogIdx + 1 + i
+
+			if follIdx >= len(rf.log) {
+				// If follIdx is out of range, there is no more overlap
+				break
+			}
+
+			follEntry := rf.log[follIdx]
+			ldrEntry := args.Entries[i]
+
+			if follEntry.Term != ldrEntry.Term {
+				// don't leak memory (necessary since log entries contain pointers)
+				for j := follIdx; j < len(rf.log); j++ {
+					rf.log[j] = nil
+				}
+				// there's overlap we need delete starting at follIdx
+				rf.log = rf.log[0:follIdx]
+				DPrintf("[%v] (follower)'s log has been truncated. current len: %v", rf.me, len(rf.log))
+				break
+			}
+		}
+	}
+
+	// We've also deleted any entries in preparation for overwriting
+	// Append any new entries not already in the log
+	// Either there was no overlap (append at end of rf.log) OR there was overlap and we deleted any entries with conflicting terms. // TODO But could there have been overlap with no conflicts? That may give us a bug? If not, maybe its not possible to enter that state
+	for i := 0; i < len(args.Entries); i++ {
+		rf.log = append(rf.log, args.Entries[i])
+	}
+
+	DPrintf("[%v] return from AE RPC after appending %v entries to our log from leader %v. New log len: %v", rf.me, len(args.Entries), args.LeaderId, len(rf.log))
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -287,13 +389,17 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
+// TODO Read from Apply channel in Start?
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
-	// Your code here (3B).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	index := len(rf.log)
+	term := rf.currentTerm
+	isLeader := rf.state == leaderNode
+	if isLeader {
+		// append command to local log
+		rf.log = append(rf.log, &entry{command, term})
+	}
 	return index, term, isLeader
 }
 
@@ -316,20 +422,168 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// Also handles sending ApplyMsg via chan up to the node's app layer once the entry has been committed???
+
+// Called by a leader who has at least 1 new entry that must be pushed to follower
+// TODO: should startAgreement & sendHBToNode functions spawn goroutines in themselves instead of being called in a spawned goroutine?
+// If the follower accepts the entries, only one AE RPC is sent
+// If not, we backtrack and send until the follower accepts or until we hear from a new leader
+func (rf *Raft) pushLogsToFollower(follower int) {
+	//DPrintf("[%v] pushing log(s) to foll %v", rf.me, follower)
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for !rf.killed() && rf.state == leaderNode {
+		// Send entries starting at nextIdx for this follower
+		firstEntryToSend := rf.nextIdx[follower]
+		if firstEntryToSend < 1 {
+			break
+		}
+		entriesToSend := rf.log[firstEntryToSend:]
+
+		args := AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIdx:   firstEntryToSend - 1,
+			PrevLogTerm:  rf.log[firstEntryToSend-1].Term,
+			Entries:      entriesToSend,
+			LeaderCommit: rf.commitIndex,
+		}
+
+		DPrintf("[%v] (leader) has len of %v. Sending entries to foll %v. PrevLogIdx: %v, PrevLogTerm: %v, LeaderCommit: %v\nAll entries:\n%v\nentriesToSend:\n%v", rf.me, len(rf.log), follower, args.PrevLogIdx, args.PrevLogTerm, args.LeaderCommit, printEntries(rf.log), printEntries(entriesToSend))
+
+		var reply AppendEntriesReply
+
+		rf.mu.Unlock()
+		ok := rf.sendAppendEntries(follower, &args, &reply)
+		rf.mu.Lock()
+
+		if !ok {
+			//DPrintf("[%v] AE rpc to foll %v was not responded to", rf.me, follower)
+			// next tick we'll spawn a new pushLogsToFollower(), and we want the current goroutine to have ended
+			// The new goroutine will handle new logs and previous ones (those the current goroutine failed to push)
+			return
+		}
+
+		// On success, update nextIdx and matchIdx
+		if reply.Success {
+			DPrintf("[%v] succeeded in pushing %v logs to foll %v", rf.me, len(entriesToSend), follower)
+			DPrintf("[%v] incrementing matchIdx for foll %v from %v by %v", rf.me, follower, rf.matchIdx[follower], len(entriesToSend))
+			rf.nextIdx[follower] += len(entriesToSend)
+			rf.matchIdx[follower] += len(entriesToSend)
+
+			// Every time we successfully send logs from a leader to a follower, check:
+			// Should we mark more of our entries as committed?
+			// AKA are there any entries that we haven't yet marked as committed, AND are replicated on a majority of servers, AND are in the current term?
+			// loop backwards over rf.log
+			for c := len(rf.log) - 1; c > 0; c-- {
+				DPrintf("[%v] determining: is log %v is ready for commit", rf.me, c)
+				if rf.isNotYetCommitted(c) && rf.isReplicatedOnMajority(c) && rf.isInSameTerm(c) {
+					DPrintf("[%v] log %v, and those after (total len is %v) marked committed", rf.me, c, len(rf.log))
+					rf.commitIndex = c
+					break
+				}
+			}
+			break
+		}
+
+		// TODO Should we do something different on rpc not okay?
+		// OR always decrement, even when disconnect
+
+		// If we fail due to log inconcsistency (reply.Success == false), decrement nextIdx and retry
+		//DPrintf("[%v] decrementing nextIdx for foll %v by 1", rf.me, follower)
+		rf.nextIdx[follower]--
+	}
+}
+
+// Following 3 function:
+// Should be called when lock held
+// Called by leader
+func (rf *Raft) isNotYetCommitted(logIdx int) bool {
+	ret := logIdx > rf.commitIndex
+	DPrintf("[%v] log not yet committed? logIdx (%v) > rf.commitIdx (%v)? %v", rf.me, logIdx, rf.commitIndex, ret)
+	return ret
+}
+func (rf *Raft) isReplicatedOnMajority(logIdx int) bool {
+	majority := len(rf.peers)/2 + 1
+	count := 0
+
+	for p := 0; p < len(rf.peers); p++ {
+		// increment count if: we're looping over self OR we've this entry is marked as replicated on self
+		if p == rf.me || rf.matchIdx[p] >= logIdx {
+			count++
+		}
+	}
+
+	ret := count >= majority
+	DPrintf("[%v] log %v has been replicated on a majority? %v", rf.me, logIdx, ret)
+	return ret
+}
+func (rf *Raft) isInSameTerm(logIdx int) bool {
+	ret := rf.log[logIdx].Term == rf.currentTerm
+	DPrintf("[%v] log %v's term is the same as ours? %v", rf.me, logIdx, ret)
+	return ret
+}
+
+func (rf *Raft) apply() {
+	for !rf.killed() {
+		time.Sleep(time.Duration(20) * time.Millisecond)
+
+		// if commitIdx > lastApplied, send to apply channel
+		rf.mu.Lock()
+
+		if rf.commitIndex > rf.lastApplied {
+			DPrintf("[%v] commitIdx (%v) is > lastApplied (%v)", rf.me, rf.commitIndex, rf.lastApplied)
+
+			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+				DPrintf("[%v] sending ApplyMsg with idx %v, cmd %v to applyCh", rf.me, i, rf.log[i].Cmd)
+				DPrintf("[%v], log idx's and commands: %v", rf.me, printEntries(rf.log))
+				rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Cmd, CommandIndex: i}
+				rf.lastApplied++
+			}
+
+			// TODO: refactor loop - start i at lastApplied (+1)
+			//for i := 1; i <= rf.commitIndex-rf.lastApplied; i++ {
+			//	idxToApply := rf.lastApplied + i
+			//	DPrintf("[%v] sending ApplyMsg with idx %v, cmd %v to applyCh", rf.me, idxToApply, rf.log[idxToApply].Cmd)
+			//	rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[idxToApply].Cmd, CommandIndex: idxToApply}
+			//}
+			//rf.lastApplied += rf.commitIndex - rf.lastApplied
+		}
+		rf.mu.Unlock()
+	}
+}
+
 // A ticker function that handlers the election process
 func (rf *Raft) ticker() {
 
 	// Exit when killed
 	for !rf.killed() {
 
+		//// if commitIdx < lastApplied, send to apply channel
+		//rf.mu.Lock()
+		//DPrintf("[%v] commitIdx (%v) > lastApplied (%v)? %v", rf.me, rf.commitIndex, rf.lastApplied, rf.commitIndex > rf.lastApplied)
+		//
+		//if rf.commitIndex > rf.lastApplied {
+		//	// TODO: refactor loop - start i at lastApplied (+1)
+		//	for i := 1; i <= rf.commitIndex-rf.lastApplied; i++ {
+		//		idxToApply := rf.lastApplied + i
+		//		DPrintf("[%v] sending ApplyMsg with idx %v, cmd %v to applyCh", rf.me, idxToApply, rf.log[idxToApply].Cmd)
+		//		rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[idxToApply].Cmd, CommandIndex: idxToApply}
+		//	}
+		//	rf.lastApplied += rf.commitIndex - rf.lastApplied
+		//}
+		//rf.mu.Unlock()
+
 		// Choose new electionTimeout interval each period so an unlucky set of choices don't haunt us for whole life of node
-		// electionTimeout will be between 800 & 1200 ms
-		timeoutInterval := 800 + (rand.Int63() % 400)
+		// electionTimeout will be between 400 & 800 ms
+		timeoutInterval := 400 + (rand.Int63() % 400)
 
 		// First wait, then switch
 		time.Sleep(time.Duration(timeoutInterval) * time.Millisecond)
 
 		rf.mu.Lock()
+
 		switch rf.state {
 		case followerNode:
 			// if a follower has not received a HB recently, go directly to candidate state
@@ -352,7 +606,25 @@ func (rf *Raft) ticker() {
 				rf.recentHeartbeatReceived = false
 			}
 		case leaderNode:
-			rf.sendHeartbeatsToAllNodes()
+			// check our log: do we see a new entry? (aka is leader's lastLogIdx >= follower's nextIdx?) if so, startAgreement. Otherwise, send HBs to everyone.
+
+			// Loop through followers. Push new entries via startAgreement OR send HB in this idle period. For self, ensure matchIdx is correct
+			for i := 0; i < len(rf.peers); i++ {
+
+				if i == rf.me {
+					// don't push logs to self, but we do need to update matchIdx for self
+					//DPrintf("[%v] updating (foll) %v (self) matchIdx from %v to %v", rf.me, i, rf.matchIdx[rf.me], rf.commitIndex)
+					rf.matchIdx[rf.me] = rf.commitIndex
+				} else if rf.lastLogIdx() >= rf.nextIdx[i] {
+					// If we have a new log entry that must be pushed to follower i, spawn agreement process
+					//DPrintf("[%v] (leader) has new log(s) that are about to be pushed to foll (%v)", rf.me, i)
+					go rf.pushLogsToFollower(i)
+				} else {
+					// Not necessary to send HBs to self b/c we only check for !recentHBReceived if we're a follower or cand
+					//DPrintf("[%v] (leader) is about to send HB to foll (%v) during this idle period", rf.me, i)
+					go rf.sendHeartbeatToNode(i)
+				}
+			}
 		}
 		rf.mu.Unlock()
 	}
@@ -360,22 +632,24 @@ func (rf *Raft) ticker() {
 
 // called by a candidate rf server. lock not held
 func (rf *Raft) startElection() {
-
 	rf.mu.Lock()
 	rf.currentTerm++
+	//DPrintf("[%v] starting election for term %v", rf.me, rf.currentTerm)
 	rf.recentHeartbeatReceived = false
 	rf.mu.Unlock()
 
-	//rf.votedFor = rf.me
 	yesVotes := 0
 	voteCount := 0
 	var voteMutex sync.Mutex
 	cond := sync.NewCond(&voteMutex)
 
+	tempMatchIdx := make([]int, len(rf.peers))
 	// Spawn len(rf.peers) goroutines, that each request a vote from a different node
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
+			rf.mu.Lock()
 			rf.votedFor = rf.me
+			rf.mu.Unlock()
 			yesVotes++
 		} else {
 			go func(nodeIdx int) {
@@ -384,14 +658,14 @@ func (rf *Raft) startElection() {
 
 					rf.mu.Lock()
 					var reply RequestVoteReply
-					args := RequestVoteArgs{rf.currentTerm, rf.me}
+					lastLogIdx := rf.lastLogIdx()
+					args := RequestVoteArgs{rf.currentTerm, rf.me, lastLogIdx, rf.log[lastLogIdx].Term}
 					rf.mu.Unlock()
 
 					// Sender (rf) does not hold lock here
 					rpcOk := rf.sendRequestVote(nodeIdx, &args, &reply)
 
 					voteMutex.Lock()
-					defer voteMutex.Unlock()
 
 					// 2 outcomes for RPC call:
 					// 1. success, receive either yes or no vote
@@ -400,19 +674,25 @@ func (rf *Raft) startElection() {
 
 					if rpcOk {
 						rf.mu.Lock()
-						// if RPC recipient's term is higher than this candidate's term, this cand --> becomes a follower
+						// if RPC recipient's term is higher than this candidate's term, we'll have to update cand (soon to be follower, since vote will not have been granted)'s term
 						if reply.Term > rf.currentTerm {
 							rf.currentTerm = reply.Term
 							rf.state = followerNode
 						} else if reply.VoteGranted {
 							yesVotes++
+						} else {
+							//DPrintf("[%v] (cand) downgrading to follower after not receiving yes vote from foll (%v)", rf.me, nodeIdx)
+							rf.state = followerNode
 						}
 						rf.mu.Unlock()
 
+						tempMatchIdx[nodeIdx] = reply.LastLogIdx
 						voteCount++
 						cond.Broadcast()
+						voteMutex.Unlock()
 						return
 					}
+					voteMutex.Unlock()
 				}
 			}(i)
 		}
@@ -429,52 +709,46 @@ func (rf *Raft) startElection() {
 	if yesVotes >= majority {
 		rf.mu.Lock()
 		rf.state = leaderNode
+		// Initialize nextIdx for all followers (and self), to: leader last log index + 1
+		// Use tempMatchIdx, which we received from each reply, to init matchIdx for each peer
+		initialNextIdx := rf.lastLogIdx() + 1
+		DPrintf("[%v] won election for term %v", rf.me, rf.currentTerm)
+		for i := 0; i < len(rf.peers); i++ {
+			rf.nextIdx = append(rf.nextIdx, initialNextIdx)
+			rf.matchIdx = append(rf.matchIdx, tempMatchIdx[i])
+		}
 		rf.mu.Unlock()
 	}
 
 	voteMutex.Unlock()
 }
 
-// TODO: incorporate the 'idle' factor into this. Should only send when (leader? is) idle
-func (rf *Raft) sendHeartbeatsToAllNodes() {
-	// Can send 10 RPCs a second, about 1 every 100 seconds
-	// time between heartbeats should be between 100 & 300 ms
-	timeBetweenHeartbeats := 100 + (rand.Int63() % 200)
+// send 1 HB to nodeIdx & process response
+func (rf *Raft) sendHeartbeatToNode(nodeIdx int) {
+	rf.mu.Lock()
+	//DPrintf("[%v] sending HB to foll %v", rf.me, nodeIdx)
+	var reply AppendEntriesReply
+	args := AppendEntriesArgs{rf.currentTerm, rf.me, -1, -1, make([]*entry, 0), rf.commitIndex}
 
-	for i := 0; i < len(rf.peers); i++ {
-		go rf.sendHeartbeatsToNode(i, timeBetweenHeartbeats)
-	}
-}
+	rf.mu.Unlock()
 
-// periodically send heartbeat, process response, wait, repeat while not killed
-// rf's lock not held when called
-func (rf *Raft) sendHeartbeatsToNode(nodeIdx int, timeBetweenHeartbeats int64) {
-	for !rf.killed() {
+	rpcOk := rf.sendAppendEntries(nodeIdx, &args, &reply)
+
+	if !rpcOk {
+		// on network failure, downgrade leader to follower
 		rf.mu.Lock()
-		var reply AppendEntriesReply
-		args := AppendEntriesArgs{rf.currentTerm, rf.me}
+		rf.state = followerNode
 		rf.mu.Unlock()
-
-		// Sender (rf)'s lock not held
-		rpcOk := rf.sendAppendEntries(nodeIdx, &args, &reply)
-
-		if !rpcOk {
-			// on network failure, downgrade leader to follower, stop sending heartbeats
-			rf.mu.Lock()
-			rf.state = followerNode
-			rf.mu.Unlock()
-			return
-		} else if !reply.Success {
-			// if RPC goes through but reply.Success? is a fail, that means sender's term was less than receivers. stop sending heartbeats
-			rf.mu.Lock()
-			rf.currentTerm = reply.Term
-			rf.state = followerNode
-			rf.mu.Unlock()
-			return
-		}
-
-		time.Sleep(time.Duration(timeBetweenHeartbeats) * time.Millisecond)
+	} else if !reply.Success {
+		// RPC goes through but reply.Success == fail
+		// -> sender's term was less than receiver's
+		// update sender's current term, downgrade to follower
+		rf.mu.Lock()
+		rf.currentTerm = reply.Term
+		rf.state = followerNode
+		rf.mu.Unlock()
 	}
+
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -499,12 +773,24 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = followerNode
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.log = append(rf.log, &entry{nil, 0}) // We want entries to be zero-indexed
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	// start periodic check for committed logs so they can be applied (this will be more frequent than ticker)
+	go rf.apply()
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
 	return rf
+}
+
+// Should be called when lock held
+func (rf *Raft) lastLogIdx() int {
+	return len(rf.log) - 1
 }
