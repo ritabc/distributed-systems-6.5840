@@ -374,7 +374,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Either there was no overlap (append at end of rf.log) OR there was overlap and we deleted any entries with conflicting terms. // TODO But could there have been overlap with no conflicts? That may give us a bug? If not, maybe its not possible to enter that state
 	// Skip on HBs, naturally
 	for i := 0; i < len(args.Entries); i++ {
-		DPrintf("[%v] appending log %v-%v at idx: %v", rf.me, args.Entries[i].Term, args.Entries[i].Cmd, len(rf.log))
+		//DPrintf("[%v] appending log %v-%v at idx: %v", rf.me, args.Entries[i].Term, args.Entries[i].Cmd, len(rf.log))
 		rf.log = append(rf.log, args.Entries[i])
 	}
 
@@ -466,9 +466,9 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 			LeaderCommit: rf.commitIndex,
 		}
 
-		DPrintf("[%v] (leader) has len of %v. Sending entries to foll %v. LeaderCommit: %v\nSending log entries from %v & on. Entries:%v", rf.me, len(rf.log), follower, args.LeaderCommit, firstEntryToSend, printEntries(rf.log, 0))
+		//DPrintf("[%v] (leader) has len of %v. Sending entries to foll %v. LeaderCommit: %v\nSending log entries from %v & on. Entries:%v", rf.me, len(rf.log), follower, args.LeaderCommit, firstEntryToSend, printEntries(rf.log, firstEntryToSend))
 
-		//DPrintf("[%v] (leader) has len of %v. Sending entries to foll %v. LeaderCommit: %v\nSending log entries from %v & on. Anomoly in entries?:%v", rf.me, len(rf.log), follower, args.LeaderCommit, firstEntryToSend, printEntriesTermAnomaly(rf.log))
+		DPrintf("[%v] (leader) has len of %v. Sending entries to foll %v. LeaderCommit: %v\nSending log entries from %v & on. Anomaly in entries?:%v", rf.me, len(rf.log), follower, args.LeaderCommit, firstEntryToSend, printEntriesTermAnomaly(rf.log))
 
 		var reply AppendEntriesReply
 
@@ -511,7 +511,6 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 			// AKA are there any entries that we haven't yet marked as committed, AND are replicated on a majority of servers, AND are in the current term?
 			// loop backwards over rf.log
 			for c := len(rf.log) - 1; c > 0; c-- {
-				DPrintf("[%v] determining: is log %v is ready for commit?", rf.me, c)
 				if rf.isNotYetCommitted(c) && rf.isReplicatedOnMajority(c) && rf.isInSameTerm(c) {
 					DPrintf("[%v] log %v, and those after (total len is %v) marked committed", rf.me, c, len(rf.log))
 					rf.commitIndex = c
@@ -530,7 +529,7 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 func (rf *Raft) isNotYetCommitted(logIdx int) bool {
 	ret := logIdx > rf.commitIndex
 	if !ret {
-		DPrintf("[%v] log not yet committed. logIdx (%v) > rf.commitIdx (%v)? %v", rf.me, logIdx, rf.commitIndex, ret)
+		//DPrintf("[%v] log not yet committed. logIdx (%v) > rf.commitIdx (%v)? %v", rf.me, logIdx, rf.commitIndex, ret)
 	}
 	return ret
 }
@@ -547,14 +546,14 @@ func (rf *Raft) isReplicatedOnMajority(logIdx int) bool {
 
 	ret := count >= majority
 	if !ret {
-		DPrintf("[%v] log %v has been replicated on a majority? %v", rf.me, logIdx, ret)
+		//DPrintf("[%v] log %v has been replicated on a majority? %v", rf.me, logIdx, ret)
 	}
 	return ret
 }
 func (rf *Raft) isInSameTerm(logIdx int) bool {
 	ret := rf.log[logIdx].Term == rf.currentTerm
 	if !ret {
-		DPrintf("[%v] log %v's term is the same as ours? %v", rf.me, logIdx, ret)
+		//DPrintf("[%v] log %v's term is the same as ours? %v", rf.me, logIdx, ret)
 	}
 	return ret
 }
@@ -570,7 +569,7 @@ func (rf *Raft) apply() {
 			//DPrintf("[%v] commitIdx (%v) is > lastApplied (%v)", rf.me, rf.commitIndex, rf.lastApplied)
 
 			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-				DPrintf("[%v] sending ApplyMsg with idx %v, cmd %v (T%v) to applyCh", rf.me, i, rf.log[i].Cmd, rf.log[i].Term)
+				//DPrintf("[%v] sending ApplyMsg with idx %v, cmd %v (T%v) to applyCh", rf.me, i, rf.log[i].Cmd, rf.log[i].Term)
 				//DPrintf("[%v], log idx's and commands: %v", rf.me, printEntries(rf.log, 0))
 				rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Cmd, CommandIndex: i}
 				rf.lastApplied++
@@ -748,6 +747,8 @@ func (rf *Raft) startElection() {
 		// Use tempMatchIdx, which we received from each reply, to init matchIdx for each peer
 		initialNextIdx := rf.lastLogIdx() + 1
 		DPrintf("[%v] won election for term %v with %v votes", rf.me, rf.currentTerm, yesVotes)
+		rf.nextIdx = make([]int, 0, 5)
+		rf.matchIdx = make([]int, 0, 5)
 		for i := 0; i < len(rf.peers); i++ {
 			rf.nextIdx = append(rf.nextIdx, initialNextIdx)
 			rf.matchIdx = append(rf.matchIdx, tempMatchIdx[i])
