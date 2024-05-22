@@ -269,7 +269,11 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // currentTerm - used by leader to update its term & to step down if args.Term < reply.Term
 	Success bool // true if follower contained entry matching requester's prevLog, false otherwise
-	// Your code for 3B here
+
+	// Information on conflicting entries, to help with fast (bulk) backup (a leader can decrement nextIdx for a follower by more than just 1)
+	XTerm   int // conflicting entry's term
+	XIdx    int // idx of 1st entry with that term
+	XLength int // length of follower's log
 }
 
 // Handler for recipient of an AppendEntries RPC call
@@ -288,14 +292,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// Fail if log doesn't contain an entry at prevLogIdx with term == prevLogTerm
-	// First - do we have an entry at prevLogIdx? and
-	// Second - is its term == prevLogTerm?
-	// Logic:
-	// if noEntryAtPrevLogIdx || itsTermIsNot==PrevLogTerm
-	if args.PrevLogIdx < 0 || args.PrevLogIdx >= len(rf.log) || rf.log[args.PrevLogIdx].Term != args.PrevLogTerm {
+	// Early exit if leader's prevLogIdx is out of range of our log - this matches Case 3 of fast backup
+	if args.PrevLogIdx < 0 || args.PrevLogIdx >= len(rf.log) {
+		DPrintf("[%v], when attemting to append %v entries, has prevLogIdx %v out of range. len(rf.log): %v", rf.me, len(args.Entries), args.PrevLogIdx, len(rf.log))
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		reply.XLength = len(rf.log)
+		reply.XTerm = -1
+		reply.XIdx = -1
+		return
+	}
+
+	// Early exit - Conflicting terms at leader's PrevLogIdx, match for Cases 1,2 of fast backup
+	if rf.log[args.PrevLogIdx].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		reply.XTerm = rf.log[args.PrevLogIdx].Term
+		reply.XIdx = rf.getFirstIdxWithTerm(rf.log[args.PrevLogIdx].Term)
+		DPrintf("[%v], found conflicting entries when appending %v entries. Our term at prevLogIdx (%v): %v != PrevLogTerm: %v. Set XIdx: %v", rf.me, len(args.Entries), args.PrevLogIdx, rf.log[args.PrevLogIdx].Term, args.PrevLogTerm, reply.XIdx)
+		DPrintf("[%v] received unsuccessful push of leaders: entries %v", rf.me, printEntries(args.Entries, 0))
 		return
 	}
 
@@ -350,12 +365,30 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.log = append(rf.log, args.Entries[i])
 	}
 
+	if len(args.Entries) > 0 {
+		DPrintf("[%v] succeeded in appending %v entries to log. new len: %v", rf.me, len(args.Entries), len(rf.log))
+	}
 	// Since our log is now equivalent to the leaders
 	// Learn from leader which entries in our newly updated log have been committed
 	// Do this on actual AE's && HB's
 	if args.LeaderCommit > rf.commitIndex {
+		DPrintf("[%v] updating commitIdx from %v to min(%v, %v)", rf.me, rf.commitIndex, args.LeaderCommit, rf.lastLogIdx())
 		rf.commitIndex = min(args.LeaderCommit, rf.lastLogIdx())
 	}
+}
+
+func (rf *Raft) getFirstIdxWithTerm(term int) int {
+	for i, e := range rf.log {
+		// skip if first (nil) log, or if its already committed
+		if i == 0 || i <= rf.commitIndex {
+			continue
+		}
+
+		if e.Term == term {
+			return i
+		}
+	}
+	return -1
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -383,6 +416,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := rf.state == leaderNode
 	if isLeader {
 		// append command to local log
+		DPrintf("[%v] receiving command %v, T%v at idx %v", rf.me, command, term, index)
 		rf.log = append(rf.log, &entry{command, term})
 	}
 	return index, term, isLeader
@@ -449,31 +483,66 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 			return
 		}
 
+		// Otherwise, if we're here and have no success, we have log inconsistency. To back up faster, decrement nextIdx by smart amount, then retry
+		// 3 Cases to handle:
+		/// 1. If leader doesn't have xterm; nextIdx = xIdx
+		/// 2. If leader has xterm; nextIdx = idx of leader's last entry for xterm
+		/// 3. follower's log is too short; nextIdx = xLen
 		if !reply.Success {
-			// If we fail due to log inconsistency (reply.Success == false), decrement nextIdx and retry
-			rf.nextIdx[follower]--
+			leaderHasXTerm, leadersLastEntryForXTerm := rf.lookupXTerm(reply.XTerm)
+
+			if reply.XTerm == -1 { // Case 3
+				DPrintf("[%v] fast back up case 3 (follower's log len is too short). nextIdx for foll %v becoming %v", rf.me, follower, reply.XLength)
+
+				rf.nextIdx[follower] = reply.XLength
+			} else if !leaderHasXTerm { // Case 1
+				DPrintf("[%v] fast back up case 1 (leader doesn't have xTerm %v). nextIdx for foll %v becoming xIdx %v", rf.me, reply.XTerm, follower, reply.XIdx)
+				rf.nextIdx[follower] = reply.XIdx
+			} else { // Case 2
+				DPrintf("[%v] fast back up case 2 (leader has xTerm %v). nextIdx for foll %v becoming leadersLastEntryForXTerm %v", rf.me, reply.XTerm, follower, leadersLastEntryForXTerm)
+				rf.nextIdx[follower] = leadersLastEntryForXTerm
+			}
+			//rf.nextIdx[follower]-- // TODO remove
 			continue
 		}
 
-		// On success, update nextIdx and matchIdx
-		if reply.Success {
-			rf.nextIdx[follower] += len(entriesToSend)
-			rf.matchIdx[follower] += len(entriesToSend)
+		// We have success - update nextIdx and matchIdx
+		rf.nextIdx[follower] += len(entriesToSend)
+		rf.matchIdx[follower] += len(entriesToSend)
 
-			// Every time we successfully send logs from a leader to a follower, check:
-			// Should we mark more of our entries as committed?
-			// AKA are there any entries that we haven't yet marked as committed, AND are replicated on a majority of servers, AND are in the current term?
-			// loop backwards over rf.log
-			for c := len(rf.log) - 1; c > 0; c-- {
-				if rf.isNotYetCommitted(c) && rf.isReplicatedOnMajority(c) && rf.isInSameTerm(c) {
-					rf.commitIndex = c
-					break
-				}
+		// Every time we successfully send logs from a leader to a follower, check:
+		// Should we mark more of our entries as committed?
+		// AKA are there any entries that we haven't yet marked as committed, AND are replicated on a majority of servers, AND are in the current term?
+		// loop backwards over rf.log
+		for c := len(rf.log) - 1; c > 0; c-- {
+			if rf.isNotYetCommitted(c) && rf.isReplicatedOnMajority(c) && rf.isInSameTerm(c) {
+				DPrintf("[%v] updating commitIdx to c %v", rf.me, c)
+				rf.commitIndex = c
+				break
 			}
-			break
 		}
+		break
 
 	}
+}
+
+// Returns bool (does rf have any entries with follXTerm?) and it's idx if so, -1 if not
+func (rf *Raft) lookupXTerm(follXTerm int) (hasXTerm bool, leaderXTermIdx int) {
+	// loop backwards over leader (this) log
+	// search for entry with term == follXTerm
+	// if found, return true, that first entry's idx
+	// if not found, return false, -1
+	for i := len(rf.log) - 1; i > 0; i-- {
+		if i <= rf.commitIndex {
+			continue
+		}
+		leaderEntry := rf.log[i]
+		if leaderEntry.Term == follXTerm {
+			DPrintf("[%v] (leader) found an entry at %v with follower's conflicting term %v", rf.me, i, follXTerm)
+			return true, i
+		}
+	}
+	return false, -1
 }
 
 // Following 3 functions:
@@ -507,6 +576,7 @@ func (rf *Raft) apply() {
 
 		if rf.commitIndex > rf.lastApplied {
 			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+				DPrintf("[%v] sending applyMsg idx %v. commitIdx (%v) > lastApplied (%v)", rf.me, i, rf.commitIndex, rf.lastApplied)
 				rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Cmd, CommandIndex: i}
 				rf.lastApplied++
 			}
@@ -578,6 +648,7 @@ func (rf *Raft) ticker() {
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	rf.currentTerm++
+	//DPrintf("[%v] starting election, T%v", rf.me, rf.currentTerm)
 	rf.recentHeartbeatReceived = false
 	rf.mu.Unlock()
 
@@ -656,6 +727,7 @@ func (rf *Raft) startElection() {
 
 	if yesVotes >= majority {
 		rf.mu.Lock()
+		DPrintf("[%v] wins election T%v", rf.me, rf.currentTerm)
 		rf.state = leaderNode
 		// Initialize nextIdx for all followers (and self), to: leader last log index + 1
 		// Use tempMatchIdx, which we received from each reply, to init matchIdx for each peer
