@@ -163,7 +163,6 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	Term        int
 	VoteGranted bool
-	LastLogIdx  int // index of last entry in voter's log
 }
 
 // RequestVote RPC handler.
@@ -186,7 +185,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-		reply.LastLogIdx = len(rf.log) - 1
 		return
 	}
 
@@ -214,7 +212,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if rf.me != args.CandidateId {
 			rf.state = followerNode
 		}
-		reply.LastLogIdx = len(rf.log) - 1
 	}
 
 	//DPrintf("[%v] persist: save. at end of RV RPC handler {l%v, T%v v%v}", rf.me, len(rf.log), rf.currentTerm, rf.votedFor)
@@ -288,7 +285,7 @@ type AppendEntriesReply struct {
 
 	// Information on conflicting entries, to help with fast (bulk) backup (a leader can decrement nextIdx for a follower by more than just 1)
 	XTerm   int // conflicting entry's term
-	XIdx    int // idx of 1st entry with that term
+	XIdx    int // idx of first entry with that term // not first - latest?
 	XLength int // length of follower's log
 }
 
@@ -314,7 +311,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Early exit if leader's prevLogIdx is out of range of our log - this matches Case 3 of fast backup
 	if args.PrevLogIdx < 0 || args.PrevLogIdx >= len(rf.log) {
-		DPrintf("[%v], when attempting to append %v entries, has prevLogIdx %v out of range. len(rf.log): %v. our log: %v", rf.me, len(args.Entries), args.PrevLogIdx, len(rf.log), printEntries(rf.log, 0))
+		DPrintf("[%v], failure on attempt to append %v entries, has prevLogIdx %v out of range. len(rf.log): %v. our log: %v", rf.me, len(args.Entries), args.PrevLogIdx, len(rf.log), printEntries(rf.log, 0))
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		reply.XLength = len(rf.log)
@@ -329,8 +326,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		reply.XTerm = rf.log[args.PrevLogIdx].Term
 		reply.XIdx = rf.getFirstIdxWithTerm(rf.log[args.PrevLogIdx].Term)
+
+		//reply.XIdx = rf.getLatestIdxWithTerm(rf.log[args.PrevLogIdx].Term)
 		DPrintf("[%v], found conflicting entries when appending %v entries. Our term at prevLogIdx (%v): %v != PrevLogTerm: %v. Set XIdx: %v", rf.me, len(args.Entries), args.PrevLogIdx, rf.log[args.PrevLogIdx].Term, args.PrevLogTerm, reply.XIdx)
-		DPrintf("[%v] received unsuccessful push of leaders: entries %v", rf.me, printEntries(args.Entries, 0))
+		DPrintf("[%v] failure on attempt to accept leader %v's push of entries: %v", rf.me, args.LeaderId, printEntries(args.Entries, 0))
 		return
 	}
 
@@ -347,33 +346,30 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 
 	// Follower must remove any entries in our log which conflict with those of the leader
-	// Entries from our log that are committed will not be in conflict
-	// (either they would not have been committed OR the current leader wouldn't have been elected (voted for by majority))
-	// In our log, loop from commitIndex+1 -> the end
-	if args.PrevLogIdx < len(rf.log)-1 {
-		for follIdx := rf.commitIndex + 1; follIdx < len(rf.log); follIdx++ {
-			entriesFromLeaderIdx := follIdx - args.PrevLogIdx - 1
-			follEntry := rf.log[follIdx]
+	// range over args.Entries (leader's log) with leaderIdx, leaderEntry
+	// if follEntry's term != leader's entry's term, delete it and those following
 
-			// follIdx has surpassed leader's entries (or it is negative)
-			if entriesFromLeaderIdx < 0 || entriesFromLeaderIdx >= len(args.Entries) {
+	DPrintf("[%v] attempt at receiving %v entries from leader %v: args.PrevLogIdx: %v. len(rf.log): %v", rf.me, len(args.Entries), args.LeaderId, args.PrevLogIdx, len(rf.log))
+
+	if args.PrevLogIdx < len(rf.log) {
+		for leaderIdx, leaderEntry := range args.Entries {
+			follIdx := 1 + args.PrevLogIdx + leaderIdx
+			if follIdx >= len(rf.log) {
 				break
 			}
-
-			entriesFromLeaderEntry := args.Entries[entriesFromLeaderIdx]
-
-			if follEntry.Term != entriesFromLeaderEntry.Term {
+			follEntry := rf.log[follIdx]
+			if follEntry.Term != leaderEntry.Term {
 				// found conflicting entry
+				DPrintf("[%v] deleting entry (idx %v) from log and all following: conflicting terms: follEntry.Term: %v != %v : leaderEntry.Term", rf.me, follIdx, follEntry.Term, leaderEntry.Term)
 				// delete it and those following
 				// first, don't leak memory (necessary since log entries contain pointers)
 				for j := follIdx; j < len(rf.log); j++ {
 					rf.log[j] = nil
 				}
+
 				// then, re-assign rf.log, shortening its length
 				rf.log = rf.log[0:follIdx]
-				break
 			}
-
 		}
 	}
 
@@ -383,6 +379,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Naturally skip on HBs
 	for i := 0; i < len(args.Entries); i++ {
 		DPrintf("[%v] received cmd %v-%v from leader %v. Adding to log at idx %v", rf.me, args.Entries[i].Term, args.Entries[i].Cmd, args.LeaderId, len(rf.log))
+		// If our commitIdx is higher than args.PrevLogIdx, then skip
+		if rf.commitIndex > args.PrevLogIdx {
+			continue
+		}
 		rf.log = append(rf.log, args.Entries[i])
 	}
 
@@ -392,6 +392,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Since our log is now equivalent to the leaders
 	// Learn from leader which entries in our newly updated log have been committed
 	// Do this on actual AE's && HB's
+	DPrintf("[%v] during receipt of %v entries from leader %v, check commitIdx: args.LeaderCommit: %v: rf.commitIdx: %v", rf.me, len(args.Entries), args.LeaderId, args.LeaderCommit, rf.commitIndex)
 	if args.LeaderCommit > rf.commitIndex {
 		DPrintf("[%v] updating commitIdx from %v to min(%v, %v)", rf.me, rf.commitIndex, args.LeaderCommit, len(rf.log)-1)
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
@@ -409,6 +410,16 @@ func (rf *Raft) getFirstIdxWithTerm(term int) int {
 			continue
 		}
 
+		if e.Term == term {
+			return i
+		}
+	}
+	return -1
+}
+
+func (rf *Raft) getLatestIdxWithTerm(term int) int {
+	for i := len(rf.log) - 1; i >= 0; i-- {
+		e := rf.log[i]
 		if e.Term == term {
 			return i
 		}
@@ -505,6 +516,10 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 		if !ok {
 			// next tick we'll spawn a new pushLogsToFollower(), and we want the current goroutine to have ended
 			// The new goroutine will handle new logs and previous ones (those the current goroutine failed to push)
+			DPrintf("[%v] attempt to send AE to foll %v failed (%v entries): !ok", rf.me, follower, len(args.Entries))
+
+			// update nextIdx for follower, so we'll send them again
+			//rf.nextIdx[follower] -= len(args.Entries)
 			return
 		}
 
@@ -526,21 +541,21 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 			leaderHasXTerm, leadersLastEntryForXTerm := rf.lookupXTerm(reply.XTerm)
 
 			if reply.XTerm == -1 { // Case 3
-				//DPrintf("[%v] fast back up case 3 (follower's log len is too short). nextIdx for foll %v becoming %v", rf.me, follower, reply.XLength)
+				DPrintf("[%v] fast back up case 3 (follower's log len is too short). nextIdx for foll %v: %v -> %v (xLength)", rf.me, follower, rf.nextIdx[follower], reply.XLength)
 
 				rf.nextIdx[follower] = reply.XLength
 			} else if !leaderHasXTerm { // Case 1
-				//DPrintf("[%v] fast back up case 1 (leader doesn't have xTerm %v). nextIdx for foll %v becoming xIdx %v", rf.me, reply.XTerm, follower, reply.XIdx)
+				DPrintf("[%v] fast back up case 1 (leader doesn't have xTerm %v). nextIdx for foll %v: %v -> %v (xIdx)", rf.me, reply.XTerm, follower, rf.nextIdx[follower], reply.XIdx)
 				rf.nextIdx[follower] = reply.XIdx
 			} else { // Case 2
-				//DPrintf("[%v] fast back up case 2 (leader has xTerm %v). nextIdx for foll %v becoming leadersLastEntryForXTerm %v", rf.me, reply.XTerm, follower, leadersLastEntryForXTerm)
+				DPrintf("[%v] fast back up case 2 (leader has xTerm %v). nextIdx for foll %v: %v -> %v (leadersLastEntryForXTerm)", rf.me, reply.XTerm, follower, rf.nextIdx[follower], leadersLastEntryForXTerm)
 				rf.nextIdx[follower] = leadersLastEntryForXTerm
 			}
 			continue
 		}
 
 		// We have success - update nextIdx and matchIdx
-		DPrintf("[%v] updating (for foll %v) nextIdx from %v and matchIdx from %v by %v", rf.me, follower, rf.nextIdx[follower], rf.matchIdx[follower], args.PrevLogIdx+len(entriesToSend))
+		DPrintf("[%v] updating (for foll %v) nextIdx: %v -> %v. matchIdx: %v -> %v", rf.me, follower, rf.nextIdx[follower], rf.nextIdx[follower]+len(entriesToSend), rf.matchIdx[follower], args.PrevLogIdx+len(entriesToSend))
 		rf.nextIdx[follower] += len(entriesToSend)
 		rf.matchIdx[follower] = args.PrevLogIdx + len(entriesToSend)
 
@@ -549,11 +564,15 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 		//// AKA are there any entries that we haven't yet marked as committed, AND are replicated on a majority of servers, AND are in the current term?
 		//// loop backwards over rf.log
 		for c := len(rf.log) - 1; c > 0; c-- {
-			DPrintf("[%v] determining whether to update rf.commitIdx from %v to %v", rf.me, rf.commitIndex, c)
-			if rf.isNotYetCommitted(c) && rf.isReplicatedOnMajority(c) && rf.isInSameTerm(c) {
-				DPrintf("[%v] updates commitIdx to c %v", rf.me, c)
-				rf.commitIndex = c
-				break
+			// Entry at c is only a candidate for commit if term is currentterm
+			if rf.log[c].Term == rf.currentTerm {
+				DPrintf("[%v] c (%v) in current Term: determining whether to update rf.commitIdx from %v to %v (c)?", rf.me, c, rf.commitIndex, c)
+				if rf.isNotYetCommitted(c) && rf.isReplicatedOnMajority(c) && rf.isInSameTerm(c) {
+					DPrintf("[%v] updates commitIdx to c %v", rf.me, c)
+					rf.commitIndex = c
+					break
+				}
+			} else {
 			}
 		}
 		break
@@ -601,7 +620,7 @@ func (rf *Raft) isReplicatedOnMajority(logIdx int) bool {
 
 	ret := count >= majority
 	if !ret {
-		DPrintf("[%v]. Should we commit log idx %v? failed: idx %v only replicated on %v (not majority (%v))", rf.me, logIdx, logIdx, count, majority)
+		DPrintf("[%v]. Should we commit log idx %v? failed: idx %v only replicated on %v ([%v] does not yet recognize majority (%v))", rf.me, logIdx, logIdx, count, rf.me, majority)
 	}
 	return ret
 }
@@ -674,14 +693,14 @@ func (rf *Raft) ticker() {
 
 				if i == rf.me {
 					// don't push logs to self, but we do need to update matchIdx for self
-					DPrintf("[%v] updating matchIdx for self to: %v (commitIdx)", rf.me, rf.commitIndex)
+					DPrintf("[%v] updating matchIdx for foll (self) to: %v -> %v (commitIdx)", rf.me, rf.matchIdx[rf.me], rf.commitIndex)
 					rf.matchIdx[rf.me] = rf.commitIndex
 
 					// Usually, we notify nodes of HB on pushLogs or sendHB, but since we'll skip that for ourself, tell ourself to record a HB
 					rf.recentHeartbeatReceived = true
 				} else if len(rf.log)-1 >= rf.nextIdx[i] {
 					// If we have a new log entry that must be pushed to follower i, spawn agreement process
-					DPrintf("[%v] will push %v entries to foll %v", rf.me, len(rf.log[rf.nextIdx[i]:]), i)
+					//DPrintf("[%v] will push %v entries to foll %v", rf.me, len(rf.log[rf.nextIdx[i]:]), i)
 					go rf.pushLogsToFollower(i)
 				} else {
 					// Not necessary to send HBs to self b/c we only check for !recentHBReceived if we're a follower or cand
@@ -714,7 +733,6 @@ func (rf *Raft) startElection() {
 	var voteMutex sync.Mutex
 	cond := sync.NewCond(&voteMutex)
 
-	tempMatchIdx := make([]int, len(rf.peers))
 	// Spawn len(rf.peers) goroutines, that each request a vote from a different node
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -765,8 +783,6 @@ func (rf *Raft) startElection() {
 							} else {
 								rf.state = followerNode
 							}
-
-							tempMatchIdx[nodeIdx] = reply.LastLogIdx
 						}
 					} else {
 						voteMutex.Lock()
@@ -802,9 +818,9 @@ func (rf *Raft) startElection() {
 		for i := 0; i < len(rf.peers); i++ {
 			rf.nextIdx = append(rf.nextIdx, initialNextIdx)
 			DPrintf("[%v] nextIdx for [%v]: %v", rf.me, i, initialNextIdx)
-			rf.matchIdx = append(rf.matchIdx, tempMatchIdx[i])
-			DPrintf("[%v] matchIdx for [%v]: %v", rf.me, i, tempMatchIdx[i])
+			rf.matchIdx = append(rf.matchIdx, 0)
 		}
+		DPrintf("[%v] matchIdx for [all]: inited to 0", rf.me)
 		rf.mu.Unlock()
 	}
 
