@@ -186,11 +186,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	DPrintf("[%v] handling RV rpc request from %v", rf.me, args.CandidateId)
 
-	// We'll read from currTerm, votedFor, and log. If we just restarted, these must be reloaded
-	//DPrintf("[%v] persist: load. at beginning of RV (from %v) rpc handler", rf.me, args.CandidateId)
-
-	rf.readPersist(rf.persister.ReadRaftState())
-
 	// First, handle invalid RequestVote RPC
 	// Invalid if cand's term is lower than ours
 	if args.Term < rf.currentTerm {
@@ -316,9 +311,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Regardless of what happens, record heartbeat
 	//rf.recentHeartbeatReceived = true
 	//rf.lastHeartbeat = time.Now()
-	// We may have just restarted - read persistent state
-	//DPrintf("[%v] persist: load at beginning of AE (from %v) rpc handler", rf.me, args.LeaderId)
-	rf.readPersist(rf.persister.ReadRaftState())
 
 	// First, handle invalid AppendEntries RPC
 	// if sender's term is less than receiver's, fail and set reply.Term = the higher receiver's
@@ -466,7 +458,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//DPrintf("[%v] persist: load. before attempting to accept %v from client", rf.me, command)
 	rf.readPersist(rf.persister.ReadRaftState())
 	index := len(rf.log)
 	term := rf.currentTerm
@@ -506,9 +497,6 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) pushLogsToFollower(follower int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//DPrintf("[%v] persist: load. at beginning of pushLogs (to %v) func rpc handler", rf.me, follower)
-
-	rf.readPersist(rf.persister.ReadSnapshot())
 	for !rf.killed() && rf.state == leaderNode {
 		// Send entries starting at nextIdx for this follower
 		firstEntryToSend := rf.nextIdx[follower]
@@ -759,7 +747,6 @@ func (rf *Raft) ticker() {
 
 // Call when rf.mu is locked
 func (rf *Raft) becomeCandidate() {
-	rf.readPersist(rf.persister.ReadSnapshot())
 
 	rf.currentTerm++
 	DPrintf("[%v] becoming T%v cand. Resetting electiontimeout, and starting election now", rf.me, rf.currentTerm)
@@ -772,10 +759,6 @@ func (rf *Raft) becomeCandidate() {
 func (rf *Raft) startElection() {
 	//rf.mu.Lock()
 	//DPrintf("[%v] persist: load at beginning of startElection func", rf.me)
-
-	//rf.readPersist(rf.persister.ReadSnapshot())
-	//rf.currentTerm++
-	//DPrintf("[%v] starting election, T%v. SEtting electionStartedAt to now", rf.me, rf.currentTerm)
 
 	// About to communicate our info to outside world - make sure we'll remember it ourselves if we crash
 	//DPrintf("[%v] persist: save. after updating currentTerm in startElection {l%v, T%v v%v}", rf.me, len(rf.log), rf.currentTerm, rf.votedFor)
@@ -909,8 +892,6 @@ func (rf *Raft) becomeFollower() {
 // send 1 HB to nodeIdx & process response
 func (rf *Raft) sendHeartbeatToNode(nodeIdx int) {
 	rf.mu.Lock()
-	//DPrintf("[%v] persist: load. at beginning of send HB (to %v) func rpc handler", rf.me, nodeIdx)
-	rf.readPersist(rf.persister.ReadRaftState())
 	var reply AppendEntriesReply
 	// When thinking about PrevLog in a HB - we have 0 entries to apply to follower, so the previous entry is just the last one in this leader's log
 	// Important for determining whether to overwrite
