@@ -790,6 +790,7 @@ func (rf *Raft) startElection() {
 			rf.mu.Unlock()
 			voteMutex.Lock()
 			yesVotes++
+			voteCount++
 			voteMutex.Unlock()
 			continue
 		}
@@ -807,7 +808,7 @@ func (rf *Raft) startElection() {
 
 			rf.mu.Lock()
 			// Don't RV if an earlier peer demoted self
-			if rf.state != followerNode {
+			if rf.state != followerNode { // TODO: change to if candidate?
 
 				var reply RequestVoteReply
 				lastLogIdx := len(rf.log) - 1
@@ -846,8 +847,8 @@ func (rf *Raft) startElection() {
 			// Regardless of whether we sent the RV, and if we got yes/no vote, we must ++ voteCount & broadcast, so we'll know when to tally.
 			voteMutex.Lock()
 			voteCount++
-			rf.mu.Unlock()
 			voteMutex.Unlock()
+			rf.mu.Unlock()
 			cond.Broadcast()
 		}(i)
 	}
@@ -880,7 +881,7 @@ func (rf *Raft) startElection() {
 		voteMutex.Unlock()
 	} else {
 		voteMutex.Unlock()
-		rf.mu.Unlock()
+		//rf.mu.Unlock()
 	}
 }
 
