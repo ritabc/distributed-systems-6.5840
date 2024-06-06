@@ -811,7 +811,7 @@ func (rf *Raft) startElection() {
 			if rf.state != followerNode { // TODO: change to if candidate?
 
 				var reply RequestVoteReply
-				lastLogIdx := len(rf.log) - 1
+				lastLogIdx := len(rf.log) - 1 // TODO, perhaps: lastLogIdx should be acquired outside the goroutine, b/c it could change from goroutine to goroutine, and it should actually be consistent
 				args := RequestVoteArgs{rf.currentTerm, rf.me, lastLogIdx, rf.log[lastLogIdx].Term}
 
 				DPrintf("[%v] (cand) sending RV, T%v to foll %v", rf.me, rf.currentTerm, nodeIdx)
@@ -827,8 +827,10 @@ func (rf *Raft) startElection() {
 				// 2. RPC did not go through. If this is because follower is down, we should retry later so it has a chance to come back up
 
 				if rpcOk {
-					// if RPC recipient's term is higher than this candidate's term, we'll have to update cand (soon to be follower, since vote will not have been granted)'s term
-					if reply.Term > rf.currentTerm {
+					if args.Term != rf.currentTerm {
+						// First, ensure no other goroutine bumped currentTerm while this goroutine was waiting on sendRV(). If currentTerm is not longer == args.Term, -> this node is already a follower, and we skip to voteCount++, even if vote granted, etc
+					} else if rf.currentTerm < reply.Term {
+						// if RPC recipient's term is higher than this candidate's term, we'll have to update our term and convert us to follower. vote will not have been granted
 						DPrintf("[%v] received ok RV response, but no vote was granted as recipient's term (%v) was higher than our own (%v). Updating currentTerm: %v -> %v, becoming follower", rf.me, reply.Term, rf.currentTerm, rf.currentTerm, reply.Term)
 						rf.currentTerm = reply.Term
 						//DPrintf("[%v] persist: save after receiving RV rpc response, updating rf.currentTerm {l%v, T%v v%v}", rf.me, len(rf.log), rf.currentTerm, rf.votedFor)
@@ -839,9 +841,8 @@ func (rf *Raft) startElection() {
 						voteMutex.Lock()
 						yesVotes++
 						voteMutex.Unlock()
-					} else {
-						//rf.becomeFollower() // TODO: why become follower here?
 					}
+					// Else (rf.currentTerm is still the same as args.Term, no one we voted for so far has a higher term than ours was at the start of this goroutine, and the voter voted for someone else), do nothing.
 				}
 			}
 			// Regardless of whether we sent the RV, and if we got yes/no vote, we must ++ voteCount & broadcast, so we'll know when to tally.
