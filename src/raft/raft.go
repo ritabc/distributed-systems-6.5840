@@ -643,7 +643,7 @@ func (rf *Raft) isInSameTerm(logIdx int) bool {
 
 func (rf *Raft) apply() {
 	for !rf.killed() {
-		time.Sleep(time.Duration(20) * time.Millisecond)
+		time.Sleep(time.Duration(40) * time.Millisecond)
 
 		rf.mu.Lock()
 
@@ -785,7 +785,10 @@ func (rf *Raft) startElection() {
 		if i == rf.me {
 			DPrintf("[%v] refraining from sending RV rpc to self, voting for self", rf.me)
 			rf.mu.Lock()
-			rf.votedFor = rf.me
+			if rf.state == candidateNode {
+				// An already spawned goroutine (see below) of this node may have already voted for someone else and become a follower. Only vote for self if this node is still a cand
+				rf.votedFor = rf.me
+			}
 			rf.persist()
 			rf.mu.Unlock()
 			voteMutex.Lock()
