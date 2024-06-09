@@ -296,7 +296,8 @@ func (rf *Raft) handleRVReply(follower int, args *RequestVoteArgs, reply *Reques
 		//DPrintf("[%v] persist: save after receiving RV rpc response, updating rf.currentTerm {l%v, T%v v%v}", rf.me, len(rf.log), rf.currentTerm, rf.votedFor)
 		rf.persist()
 		rf.becomeFollower()
-	} else if reply.VoteGranted {
+	} else if reply.VoteGranted && rf.state == candidateNode {
+		// Check to ensure we're still a candidate
 		//DPrintf("[%v] received yes vote from foll %v", rf.me, follower)
 		rf.votesCollected[follower] = true
 		if rf.quorumVoted() {
@@ -352,42 +353,44 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	// Setup for fast backup if not a HB
 	// Reject AE if leaader's prevLogIdx is out of range of our log
 	// It will be so in Case 3 of fast backup
 	// Like so
 	//// L: 4 6 6 6
 	//// F: 4
-	if args.PrevLogIdx < 0 || args.PrevLogIdx >= len(rf.log) {
-		DPrintf("[%v], failure on attempt to append %v entries, has prevLogIdx %v out of range. len(rf.log): %v. our log: %v", rf.me, len(args.Entries), args.PrevLogIdx, len(rf.log), printEntries(rf.log, 0))
-		reply.Success = false
-		reply.Term = rf.currentTerm
-		reply.XLength = len(rf.log)
-		reply.XTerm = -1
-		reply.XIdx = -1
-		return
+	if len(args.Entries) > 0 {
+		if args.PrevLogIdx < 0 || args.PrevLogIdx >= len(rf.log) {
+			DPrintf("[%v], failure on attempt to append %v entries, has prevLogIdx %v out of range. len(rf.log): %v. our log: %v", rf.me, len(args.Entries), args.PrevLogIdx, len(rf.log), printEntries(rf.log, 0))
+			reply.Success = false
+			reply.Term = rf.currentTerm
+			reply.XLength = len(rf.log)
+			reply.XTerm = -1
+			reply.XIdx = -1
+			return
+		}
+
+		// Reject AE if conflicting terms at leader's PrevLogIdx are found
+		// Matches Cases 1,2 of fast backup
+		// Case 1:
+		//// L: 4 4 6 6 6
+		//// F: 4 4 5 5
+		// Case 2:
+		//// L: 4 4 6 6 6
+		//// F: 4 4 4 4
+		// In both cases, reject and send XTerm, XIndex, XLen
+		if rf.log[args.PrevLogIdx].Term != args.PrevLogTerm {
+			reply.Success = false
+			reply.Term = rf.currentTerm
+			reply.XTerm = rf.log[args.PrevLogIdx].Term
+			reply.XIdx = rf.getFirstIdxWithTerm(reply.XTerm)
+			reply.XLength = len(rf.log) // won't be used
+
+			DPrintf("[%v], found conflicting entries when appending %v entries. Our term at prevLogIdx (%v): %v != PrevLogTerm: %v. Set XIdx: %v", rf.me, len(args.Entries), args.PrevLogIdx, rf.log[args.PrevLogIdx].Term, args.PrevLogTerm, reply.XIdx)
+			DPrintf("[%v] failure on attempt to accept leader %v's push of entries: %v", rf.me, args.LeaderId, printEntries(args.Entries, 0))
+			return
+		}
 	}
-
-	// Reject AE if conflicting terms at leader's PrevLogIdx are found
-	// Matches Cases 1,2 of fast backup
-	// Case 1:
-	//// L: 4 4 6 6 6
-	//// F: 4 4 5 5
-	// Case 2:
-	//// L: 4 4 6 6 6
-	//// F: 4 4 4 4
-	// In both cases, reject and send XTerm, XIndex, XLen
-	if rf.log[args.PrevLogIdx].Term != args.PrevLogTerm {
-		reply.Success = false
-		reply.Term = rf.currentTerm
-		reply.XTerm = rf.log[args.PrevLogIdx].Term
-		reply.XIdx = rf.getFirstIdxWithTerm(reply.XTerm)
-		reply.XLength = len(rf.log) // won't be used
-
-		DPrintf("[%v], found conflicting entries when appending %v entries. Our term at prevLogIdx (%v): %v != PrevLogTerm: %v. Set XIdx: %v", rf.me, len(args.Entries), args.PrevLogIdx, rf.log[args.PrevLogIdx].Term, args.PrevLogTerm, reply.XIdx)
-		DPrintf("[%v] failure on attempt to accept leader %v's push of entries: %v", rf.me, args.LeaderId, printEntries(args.Entries, 0))
-		return
-	}
-
 	// Otherwise, RPC requester is seen as leader, as it's term is >= ours
 	// Update our term, set reply.Term to it and make ourself a follower
 	rf.currentTerm = args.Term
@@ -619,7 +622,7 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 				rf.nextIdx[follower] = reply.XIdx
 			} else { // Case 2
 				DPrintf("[%v] fast back up case 2 (leader has xTerm %v). nextIdx for foll %v: %v -> %v (leadersLastEntryForXTerm)", rf.me, reply.XTerm, follower, rf.nextIdx[follower], leadersLastEntryForXTerm)
-				rf.nextIdx[follower] = leadersLastEntryForXTerm
+				rf.nextIdx[follower] = leadersLastEntryForXTerm + 1
 			}
 			continue
 		}
@@ -657,9 +660,10 @@ func (rf *Raft) lookupXTerm(follXTerm int) (hasXTerm bool, leaderXTermIdx int) {
 	// if found, return true, that first entry's idx
 	// if not found, return false, -1
 	for i := len(rf.log) - 1; i > 0; i-- {
-		if i <= rf.commitIndex {
-			continue
-		}
+		// TODO: WE shouldn't skip if we've already been committed - should we skip if we haven't been committed?
+		//if i <= rf.commitIndex {
+		//	continue
+		//}
 		leaderEntry := rf.log[i]
 		if leaderEntry.Term == follXTerm {
 			DPrintf("[%v] (leader) found an entry at %v with follower's conflicting term %v", rf.me, i, follXTerm)
@@ -809,19 +813,6 @@ func (rf *Raft) ticker() {
 }
 
 // Call when rf.mu is locked
-func (rf *Raft) becomeCandidate() {
-
-	rf.currentTerm++
-	DPrintf("[%v] becoming T%v cand. Resetting electiontimeout, and starting election now", rf.me, rf.currentTerm)
-	//rf.electionStartedAt = time.Now()
-	rf.votesCollected = make([]bool, len(rf.peers))
-	rf.votesCollected[rf.me] = true
-	rf.votedFor = rf.me
-	rf.resetElectionTimeout()
-	rf.persist()
-}
-
-// Call when rf.mu is locked
 func (rf *Raft) broadcastVotes() {
 	for i := 0; i < len(rf.peers); i++ {
 		if rf.state == candidateNode {
@@ -963,9 +954,22 @@ func (rf *Raft) startElection() {
 }
 
 func (rf *Raft) becomeFollower() {
-	DPrintf("[%v] becoming follower", rf.me)
+	//DPrintf("[%v] becoming follower", rf.me)
 	rf.state = followerNode
 	rf.lastHeartbeat = time.Now()
+}
+
+// Call when rf.mu is locked
+func (rf *Raft) becomeCandidate() {
+
+	rf.currentTerm++
+	//DPrintf("[%v] becoming T%v cand. Resetting electiontimeout, and starting election now", rf.me, rf.currentTerm)
+	//rf.electionStartedAt = time.Now()
+	rf.votesCollected = make([]bool, len(rf.peers))
+	rf.votesCollected[rf.me] = true
+	rf.votedFor = rf.me
+	rf.resetElectionTimeout()
+	rf.persist()
 }
 
 func (rf *Raft) becomeLeader() {
@@ -976,7 +980,7 @@ func (rf *Raft) becomeLeader() {
 	rf.matchIdx = make([]int, 0, len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIdx = append(rf.nextIdx, initialNextIdx)
-		DPrintf("[%v] nextIdx for [%v]: %v", rf.me, i, initialNextIdx)
+		//DPrintf("[%v] nextIdx for [%v]: %v", rf.me, i, initialNextIdx)
 		rf.matchIdx = append(rf.matchIdx, 0)
 	}
 }
@@ -989,7 +993,7 @@ func (rf *Raft) sendHeartbeatToNode(nodeIdx int) {
 	// Important for determining whether to overwrite
 	args := AppendEntriesArgs{rf.currentTerm, rf.me, len(rf.log) - 1, rf.log[len(rf.log)-1].Term, make([]*entry, 0), rf.commitIndex}
 
-	DPrintf("[%v] sending AE HB to %v", rf.me, nodeIdx)
+	//DPrintf("[%v] sending AE HB to %v", rf.me, nodeIdx)
 
 	if rf.state != leaderNode {
 		rf.mu.Unlock()
@@ -1018,7 +1022,7 @@ func (rf *Raft) sendHeartbeatToNode(nodeIdx int) {
 }
 
 func (rf *Raft) resetElectionTimeout() {
-	electionTimout := 300 + (rand.Int63() % 200)
+	electionTimout := 300 + (rand.Int63() % 300)
 	rf.electionTimeout = time.Duration(electionTimout) * time.Millisecond
 	rf.electionStartedAt = time.Now()
 }
