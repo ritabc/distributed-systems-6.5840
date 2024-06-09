@@ -403,6 +403,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// At this point, if we were going to reject the new entries, we would have already
 	reply.Success = true
 
+	//if len(args.Entries) == 0 {
+	//	rf.persist()
+	//	return
+	//}
+
 	// Follower must remove any entries in our log which conflict with those of the leader
 	// range over args.Entries (leader's log) with leaderIdx, leaderEntry
 	// if follEntry's term != leader's entry's term, delete it and those following
@@ -434,6 +439,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// We've now deleted any entries in preparation for overwriting
 	// Append any new entries not already in the log
 	// Either there was no overlap (append at end of rf.log) OR there was overlap and we deleted any entries with conflicting terms.
+	appendedToLog := false
 	for i := 0; i < len(args.Entries); i++ {
 		DPrintf("[%v] received cmd %v-%v from leader %v. Adding to log at idx %v", rf.me, args.Entries[i].Term, args.Entries[i].Cmd, args.LeaderId, len(rf.log))
 		// If our commitIdx is higher than args.PrevLogIdx, then skip
@@ -441,16 +447,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			continue
 		}
 		rf.log = append(rf.log, args.Entries[i])
+		appendedToLog = true
 	}
 
-	if len(args.Entries) > 0 {
-		DPrintf("[%v] success: %v entries added to log. new len: %v", rf.me, len(args.Entries), len(rf.log))
-	}
 	// Since our log is now equivalent to the leaders
 	// Learn from leader which entries in our newly updated log have been committed
 	// Do this on actual AE's && HB's
 	//DPrintf("[%v] during receipt of %v entries from leader %v, check commitIdx: args.LeaderCommit: %v: rf.commitIdx: %v", rf.me, len(args.Entries), args.LeaderId, args.LeaderCommit, rf.commitIndex)
-	if args.LeaderCommit > rf.commitIndex {
+	if appendedToLog && args.LeaderCommit > rf.commitIndex {
 		DPrintf("[%v] updating commitIdx from %v to min(%v, %v)", rf.me, rf.commitIndex, args.LeaderCommit, len(rf.log)-1)
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 
@@ -753,7 +757,7 @@ func (rf *Raft) ticker() {
 
 			if time.Since(rf.lastHeartbeat) > rf.heartbeatTimeout {
 				rf.state = candidateNode
-				DPrintf("[%v] (foll) heartbeatTimeout occurred. becoming cand, starting election", rf.me)
+				//DPrintf("[%v] (foll) heartbeatTimeout occurred. becoming cand, starting election", rf.me)
 				rf.becomeCandidate()
 				//rf.mu.Unlock()
 				//go rf.startElection() // kick off election immediately, for first time
