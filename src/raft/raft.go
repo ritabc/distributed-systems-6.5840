@@ -336,7 +336,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		DPrintf("[%v] early return from AE from %v with %v entries due to terms", rf.me, args.LeaderId, len(args.Entries))
+		DPrintf("[%v] (T%v) returning early from AE from leader %v (T%v) with %v entries due to terms", rf.me, rf.currentTerm, args.LeaderId, args.Term, len(args.Entries))
 		return
 	}
 
@@ -586,7 +586,7 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 		//argsEntriesLenBeforeAeRpc := len(args.Entries)
 		DPrintf("[%v] about to unlock for sendAE in pushLogs", rf.me)
 		rf.mu.Unlock()
-		DPrintf("[%v] about unlocked for sendAE in pushLogs", rf.me)
+		DPrintf("[%v] unlocked for sendAE in pushLogs", rf.me)
 		ok := rf.sendAppendEntries(follower, &args, &reply)
 		rf.mu.Lock()
 		//argsEntriesLenAfterAeRpc := len(args.Entries)
@@ -598,10 +598,13 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 			DPrintf("[%v] attempt to send AE to foll %v failed (%v entries): !ok", rf.me, follower, len(args.Entries))
 			//rf.waitingOnRPC[follower] = false
 			//DPrintf("[%v] unsetting wait on RPC for foll %v due to bad rpc response", rf.me, follower)
+
+			// TODO: Should we become follower here???
+			//rf.becomeFollower()
 			return
 		}
 
-		if reply.Term > rf.currentTerm {
+		if reply.Term > args.Term {
 			DPrintf("[%v] push of logs to foll %v was invalid: our term (%v) was less than follower's (%v). becoming follower", rf.me, follower, rf.currentTerm, reply.Term)
 			rf.currentTerm = reply.Term
 			//DPrintf("[%v] persist: save. after sending AE to %v from pushLogs results in early exit {l%v, T%v v%v}", rf.me, follower, len(rf.log), rf.currentTerm, rf.votedFor)
@@ -619,21 +622,9 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 		/// 1. If leader doesn't have xterm; nextIdx = xIdx
 		/// 2. If leader has xterm; nextIdx = idx of leader's last entry for xterm
 		/// 3. follower's log is too short; nextIdx = xLen
-		DPrintf("[%v] before fast back up processing", rf.me)
+		DPrintf("[%v] before fast back up processing of foll %v", rf.me, follower)
 		if !reply.Success {
-			leaderHasXTerm, leadersLastEntryForXTerm := rf.lookupXTerm(reply.XTerm)
-
-			if reply.XTerm == -1 { // Case 3
-				DPrintf("[%v] fast back up case 3 (follower's log len is too short). nextIdx for foll %v: %v -> %v (xLength)", rf.me, follower, rf.nextIdx[follower], reply.XLength)
-
-				rf.nextIdx[follower] = reply.XLength
-			} else if !leaderHasXTerm { // Case 1
-				DPrintf("[%v] fast back up case 1 (leader doesn't have xTerm %v). nextIdx for foll %v: %v -> %v (xIdx)", rf.me, reply.XTerm, follower, rf.nextIdx[follower], reply.XIdx)
-				rf.nextIdx[follower] = reply.XIdx
-			} else { // Case 2
-				DPrintf("[%v] fast back up case 2 (leader has xTerm %v). nextIdx for foll %v: %v -> %v (leadersLastEntryForXTerm)", rf.me, reply.XTerm, follower, rf.nextIdx[follower], leadersLastEntryForXTerm) // TODO: are we getting here??
-				rf.nextIdx[follower] = leadersLastEntryForXTerm + 1
-			}
+			rf.processLogInconsistency(follower, reply.XIdx, reply.XTerm, reply.XLength)
 			continue
 		}
 		DPrintf("[%v] after fast back up processing", rf.me)
@@ -677,6 +668,22 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 		//rf.waitingOnRPC[follower] = false
 		//DPrintf("[%v] unsetting wait on RPC for foll %v due to successful push", rf.me, follower)
 		break
+	}
+}
+
+func (rf *Raft) processLogInconsistency(follower int, XIdx int, XTerm int, XLength int) {
+	leaderHasXTerm, leadersLastEntryForXTerm := rf.lookupXTerm(XTerm)
+
+	if XTerm == -1 { // Case 3
+		DPrintf("[%v] fast back up case 3 (follower's log len is too short). nextIdx for foll %v: %v -> %v (xLength)", rf.me, follower, rf.nextIdx[follower], XLength)
+
+		rf.nextIdx[follower] = XLength
+	} else if !leaderHasXTerm { // Case 1
+		DPrintf("[%v] fast back up case 1 (leader doesn't have xTerm %v). nextIdx for foll %v: %v -> %v (xIdx)", rf.me, XTerm, follower, rf.nextIdx[follower], XIdx)
+		rf.nextIdx[follower] = XIdx
+	} else { // Case 2
+		DPrintf("[%v] fast back up case 2 (leader has xTerm %v). nextIdx for foll %v: %v -> %v (leadersLastEntryForXTerm)", rf.me, XTerm, follower, rf.nextIdx[follower], leadersLastEntryForXTerm) // TODO: are we getting here??
+		rf.nextIdx[follower] = leadersLastEntryForXTerm + 1
 	}
 }
 
@@ -901,16 +908,23 @@ func (rf *Raft) sendHeartbeatToNode(nodeIdx int) {
 	defer rf.mu.Unlock()
 	if !rpcOk {
 		// on network failure, downgrade leader to follower
-		DPrintf("[%v] received !ok response to AE on send of HB - becoming follower", rf.me)
-		rf.becomeFollower()
 
-	} else if !reply.Success {
-		// RPC goes through but reply.Success == fail
-		// -> sender's term was less than receiver's
-		// update sender's current term, downgrade to follower
+		// We could get !ok because we are disconnected. In which case, downgrade to follower.
+		// We could also get !ok because follower (nodeIdx) is disconnected. Should we remain leader in that case
+		DPrintf("[%v] received !ok response to AE on send of HB to foll %v - returning", rf.me, nodeIdx)
+		//rf.becomeFollower()
+		// say we remain leader. we'll return to ticker, and attempt to send HB to any remaining followers.
+		// what if we're disconnected? we'll remain leader, other nodes will move on. When we connect, we'll figure it out
+		// What if the follower is disconnected? We'll remain leader, sending HBs to other (connected) followers
+		// This sounds good - don't downgrade on network fail
+	} else if reply.Term > args.Term {
 		rf.currentTerm = reply.Term
-		DPrintf("[%v] received not success response to AE on send of HB to foll %v - becoming follower", rf.me, nodeIdx) // TODO : track
+		DPrintf("[%v] received not success response to AE on send of HB to foll %v (foll's term > ours). becoming follower", rf.me, nodeIdx)
 		rf.becomeFollower()
+	} else if !reply.Success {
+		// Get to here if there's a log inconsistency
+		DPrintf("[%v] (leader) processing log incons. with %v (follower) after HB sent", rf.me, nodeIdx)
+		rf.processLogInconsistency(nodeIdx, reply.XIdx, reply.XTerm, reply.XLength)
 	}
 	//DPrintf("[%v] persist: save after sending HB {l%v, T%v v%v}", rf.me, len(rf.log), rf.currentTerm, rf.votedFor)
 	rf.persist()
