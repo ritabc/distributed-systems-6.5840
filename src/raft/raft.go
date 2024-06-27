@@ -388,39 +388,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 
 	// If !HB, delete unnecessary entries from follower & append
-	// Start by nulling entries in follower at the location of first args.Entries of leader
+	// Start at the location of first args.Entries of leader
 	// aka at the args.PrevLogIdx + 1
 	if len(args.Entries) > 0 {
-
 		startClearingFollLogAt := args.PrevLogIdx + 1
-		if len(rf.log)-startClearingFollLogAt > 0 {
-			DPrintf("[%v] deleting %v entries, starting at idx %v\n", rf.me, len(rf.log)-startClearingFollLogAt, startClearingFollLogAt)
-		}
-		for j := startClearingFollLogAt; j < len(rf.log); j++ {
-			rf.log[j] = nil
-		}
 
-		// Now, shorten length of rf.log
-		// We already dealt with Case 3 above (follower's log is shorter than prevLogIdx), so if we reach here we will not be out of bounds
-		rf.log = rf.log[0:startClearingFollLogAt]
-
-		// Now, append
-		commitIdxGtPrevLogIdx := false
-		for i := 0; i < len(args.Entries); i++ {
-			DPrintf("[%v] received cmd %v-%v from leader %v. Adding to log at idx %v", rf.me, args.Entries[i].Term, args.Entries[i].Cmd, args.LeaderId, len(rf.log))
-			// If our commitIdx is higher than args.PrevLogIdx, then skip
-			if rf.commitIndex > args.PrevLogIdx { // Not sure if this check should be here??? // TODO
-				//fmt.Printf("Don't think I should reach here. Trying to append %v entries when foll's commitIdx (%v) is past leader's PrevLogIdx (%v) \n", len(args.Entries), rf.commitIndex, args.PrevLogIdx)
-
-				commitIdxGtPrevLogIdx = true
-				//continue??
-				//break //?
-			}
-			rf.log = append(rf.log, args.Entries[i])
-		}
-		if commitIdxGtPrevLogIdx {
-			//fmt.Printf("[%v] (foll) has commitIdx higher than idx before args.Entries. Appended %v entries to our log. Log, currently: %v\n", rf.me, len(args.Entries), printEntries(rf.log, 0))
-		}
+		rf.log = rf.log[:startClearingFollLogAt]
+		rf.log = append(rf.log, args.Entries...)
 	}
 
 	// // TODO: do this on HB? Maybe not, but then we have to check periodically?
@@ -566,7 +540,8 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 			DPrintf("[%v] SHOULD NOT REACH exiting early from pushLogsToFollower b/c rf.nextIdx for foll %v is < 1", rf.me, follower)
 			return
 		}
-		entriesToSend := rf.log[follNextIdx:]
+
+		entriesToSend := append([]*entry{}, rf.log[follNextIdx:]...)
 
 		args := AppendEntriesArgs{
 			Term:         rf.currentTerm,
@@ -773,7 +748,6 @@ func (rf *Raft) ticker() {
 			// if a follower has not received a HB recently, go directly to candidate state
 
 			if time.Since(rf.lastHeartbeat) > rf.heartbeatTimeout {
-				rf.state = candidateNode
 				//DPrintf("[%v] (foll) heartbeatTimeout occurred. becoming %v cand, starting election", rf.me, rf.currentTerm+1)
 				rf.becomeCandidate()
 				//rf.mu.Unlock()
@@ -822,7 +796,7 @@ func (rf *Raft) ticker() {
 				} else if len(rf.log) > rf.nextIdx[i] {
 					//if !rf.waitingOnRPC[i] { // don't spawn new pushLogs if still waiting for the last one
 					// If we have a new log entry that must be pushed to follower i, spawn agreement process
-					DPrintf("[%v] will push %v entries to foll %v as nextIdx[i] is: %v and len(rf.log) is %v", rf.me, len(rf.log[rf.nextIdx[i]:]), i, rf.nextIdx[i], len(rf.log))
+					//DPrintf("[%v] will push %v entries to foll %v as nextIdx[i] is: %v and len(rf.log) is %v", rf.me, len(rf.log[rf.nextIdx[i]:]), i, rf.nextIdx[i], len(rf.log))
 					go rf.pushLogsToFollower(i)
 					//} else {
 					//	DPrintf("[%v] not respawning pushLogs goroutine", rf.me) // todo: problematic when nodes are disconnected? or good?
@@ -862,6 +836,7 @@ func (rf *Raft) becomeFollower() {
 
 // Call when rf.mu is locked
 func (rf *Raft) becomeCandidate() {
+	rf.state = candidateNode
 	rf.currentTerm++
 	rf.votesCollected = make([]bool, len(rf.peers))
 	rf.votesCollected[rf.me] = true
