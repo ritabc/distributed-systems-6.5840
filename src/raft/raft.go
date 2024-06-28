@@ -284,7 +284,7 @@ func (rf *Raft) handleRVReply(follower int, args *RequestVoteArgs, reply *Reques
 		rf.currentTerm = reply.Term
 		//DPrintf("[%v] persist: save after receiving RV rpc response, updating rf.currentTerm {l%v, T%v v%v}", rf.me, len(rf.log), rf.currentTerm, rf.votedFor)
 		rf.persist()
-		rf.becomeCandidate()
+		//rf.becomeCandidate()
 		rf.becomeFollower()
 	} else if reply.VoteGranted && rf.state == candidateNode {
 		// Check to ensure we're still a candidate
@@ -392,6 +392,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// aka at the args.PrevLogIdx + 1
 	if len(args.Entries) > 0 {
 		startClearingFollLogAt := args.PrevLogIdx + 1
+		for i, e := range args.Entries {
+			DPrintf("[%v] receiving cmd %v-%v from leader, at idx %v", rf.me, e.Term, e.Cmd, startClearingFollLogAt+i)
+		}
 
 		rf.log = rf.log[:startClearingFollLogAt]
 		rf.log = append(rf.log, args.Entries...)
@@ -748,10 +751,8 @@ func (rf *Raft) ticker() {
 			// if a follower has not received a HB recently, go directly to candidate state
 
 			if time.Since(rf.lastHeartbeat) > rf.heartbeatTimeout {
-				//DPrintf("[%v] (foll) heartbeatTimeout occurred. becoming %v cand, starting election", rf.me, rf.currentTerm+1)
+				DPrintf("[%v] (foll) heartbeatTimeout occurred. becoming %v cand, starting election", rf.me, rf.currentTerm+1)
 				rf.becomeCandidate()
-				//rf.mu.Unlock()
-				//go rf.startElection() // kick off election immediately, for first time
 				rf.broadcastVotes()
 				rf.mu.Unlock()
 				continue
@@ -830,8 +831,10 @@ func (rf *Raft) broadcastVotes() {
 }
 
 func (rf *Raft) becomeFollower() {
-	rf.state = followerNode
-	rf.lastHeartbeat = time.Now()
+	if rf.state != followerNode {
+		rf.state = followerNode
+		rf.lastHeartbeat = time.Now() // if we're already a follower, don't keep resetting this (we could time out of the test before anyone becomes elected)
+	}
 }
 
 // Call when rf.mu is locked
