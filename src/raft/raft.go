@@ -193,11 +193,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// If our term is behind, reset votedFor and state
 	if args.Term > rf.currentTerm {
 		rf.votedFor = -1
+		rf.persist()
+		DPrintf("[%v] becoming follower in RV handler from cand %v as cand's term (T%v) > ours (T%v)", rf.me, args.CandidateId, args.Term, rf.currentTerm)
 		rf.becomeFollower()
 	}
 
 	// Update our term, set reply.Term to it
+	DPrintf("[%v] in RequestVote handler. We received vote request from %v - update our term from T%v->T%v", rf.me, args.CandidateId, rf.currentTerm, args.Term)
 	rf.currentTerm = args.Term
+	rf.persist()
 	reply.Term = rf.currentTerm
 
 	// Next, vote as appropriate
@@ -205,19 +209,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		//DPrintf("[%v] voting for %v", rf.me, args.CandidateId)
 
 		rf.votedFor = args.CandidateId
+		rf.persist()
 		reply.VoteGranted = true
-		rf.lastHeartbeat = time.Now()
+		rf.lastHeartbeat = time.Now() // If becomeFoll is called & we weren't already a foll, we will reset this there too. But that won't always be the case, and the paper states "If election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate: convert to candidate". AKA try to start an election if it's been a while since we received AE OR voted for someone. Thus, if we vote for someone, restart HB timer. HB timer is for checking whether leader is still alive, or if we're in the process of getting new one
 
 		// If we're voting yes for another (not self) node, downgrade self to follower
 		if rf.me != args.CandidateId {
-			//DPrintf("[%v] is voting for %v - downgrade self to follower", rf.me, args.CandidateId)
+			DPrintf("[%v] is voting for %v - downgrading self to follower", rf.me, args.CandidateId)
 			rf.becomeFollower()
 		}
-
 	}
 
-	//DPrintf("[%v] persist: save. at end of RV RPC handler {l%v, T%v v%v}", rf.me, len(rf.log), rf.currentTerm, rf.votedFor)
-	rf.persist()
+	//rf.persist()
 
 }
 
@@ -276,16 +279,25 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) handleRVReply(follower int, args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if args.Term != rf.currentTerm {
+	if args.Term != rf.currentTerm { // todo: rewrite logic
 		// First, ensure no other goroutine bumped currentTerm while this goroutine was waiting on sendRV(). If currentTerm is no longer == args.Term, -> this node is already a follower, and we skip voteCount++, even if vote granted, etc
-	} else if rf.currentTerm < reply.Term {
-		// if this cand's term is less than RPC recipient's term, we'll have to update our term and convert us to follower. vote will not have been granted
-		DPrintf("[%v] received ok RV response, but no vote was granted as recipient's term (%v) was higher than our own (%v). Updating currentTerm: %v -> %v, becoming cand then follower", rf.me, reply.Term, rf.currentTerm, rf.currentTerm, reply.Term)
-		rf.currentTerm = reply.Term
-		//DPrintf("[%v] persist: save after receiving RV rpc response, updating rf.currentTerm {l%v, T%v v%v}", rf.me, len(rf.log), rf.currentTerm, rf.votedFor)
+	} else if reply.Term > args.Term {
+		DPrintf("[%v] (cand) received RV reply from %v. the term we sent (T%v) < other's (T%v). Setting our term to %v", rf.me, follower, args.Term, reply.Term, max(rf.currentTerm, reply.Term))
+		if reply.Term >= rf.currentTerm {
+			DPrintf("[%v] calling becomeFoll in handleRVReply (reply from %v). reply.Term (%v) > args.Term (%v) && reply.Term >= rf.currentTerm (T%v)", rf.me, follower, reply.Term, args.Term, rf.currentTerm)
+			rf.becomeFollower()
+		}
+		rf.currentTerm = max(rf.currentTerm, reply.Term)
 		rf.persist()
-		//rf.becomeCandidate()
-		rf.becomeFollower()
+		//else if rf.currentTerm < reply.Term {
+		//	// if this cand's term is less than RPC recipient's term, we'll have to update our term and convert us to follower. vote will not have been granted
+		//	DPrintf("[%v] (cand) becoming follower after receiving RV reply from %v. as our term (T%v) < other's (T%v), which we're setting our term to", rf.me, follower, rf.currentTerm, reply.Term)
+		//	rf.currentTerm = reply.Term
+		//	//DPrintf("[%v] persist: save after receiving RV rpc response, updating rf.currentTerm {l%v, T%v v%v}", rf.me, len(rf.log), rf.currentTerm, rf.votedFor)
+		//	rf.persist()
+		//	//rf.becomeCandidate()
+		//
+		//	rf.becomeFollower()
 	} else if reply.VoteGranted && rf.state == candidateNode {
 		// Check to ensure we're still a candidate
 		//DPrintf("[%v] received yes vote from foll %v", rf.me, follower)
@@ -348,6 +360,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if rf.me != args.LeaderId { // in theory, we should not need to handle this call from self, but check just in case
 		// Unless we're sending to ourself (in which case we'd like to remain the leader), update our state to follower
+		DPrintf("[%v] becoming follower since we're processing AE handler from valid leader %v", rf.me, args.LeaderId)
 		rf.becomeFollower()
 	}
 
@@ -562,9 +575,9 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 
 		//DPrintf("[%v] sending AE to foll %v: %v entries", rf.me, follower, len(args.Entries))
 		//argsEntriesLenBeforeAeRpc := len(args.Entries)
-		DPrintf("[%v] about to unlock for sendAE in pushLogs", rf.me)
+		//DPrintf("[%v] about to unlock for sendAE in pushLogs", rf.me)
 		rf.mu.Unlock()
-		DPrintf("[%v] unlocked for sendAE in pushLogs", rf.me)
+		//DPrintf("[%v] unlocked for sendAE in pushLogs", rf.me)
 		ok := rf.sendAppendEntries(follower, &args, &reply)
 		rf.mu.Lock()
 		//argsEntriesLenAfterAeRpc := len(args.Entries)
@@ -577,18 +590,34 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 			//rf.waitingOnRPC[follower] = false
 			//DPrintf("[%v] unsetting wait on RPC for foll %v due to bad rpc response", rf.me, follower)
 
-			// TODO: Should we become follower here???
+			// Should we become follower here??? No: see logic in sendHB
 			//rf.becomeFollower()
 			return
 		}
 
 		if reply.Term > args.Term {
-			DPrintf("[%v] push of logs to foll %v was invalid: our term (%v) was less than follower's (%v). becoming follower", rf.me, follower, rf.currentTerm, reply.Term)
-			rf.currentTerm = reply.Term
-			//DPrintf("[%v] persist: save. after sending AE to %v from pushLogs results in early exit {l%v, T%v v%v}", rf.me, follower, len(rf.log), rf.currentTerm, rf.votedFor)
+			// In this case, args.Term (a), reply.Term (r), and rf.currentTerm (c) could relate to each other in a couple ways:
+			// 1. a == c && c < r
+			// 2. a < c < r
+			// 3. a < r < c
+			// In each case, rf.currentTerm should be set to max(r, c) (it increases monotonically)
+			// And in cases 1,2, we should become a follower
+			// In case 3, we should not.
+			// Explanation:
+			// Say AE is sent to a foll which is crashed, and will be for a while
+			// Stuff happens, our term increases and we're leader again
+			// Foll comes back online, and sends a reply.Term value greater than the args.Term we sent, but less than our currTerm.
+			DPrintf("[%v] push of logs to foll %v was invalid (foll's term (T%v) > ours, the one we sent (T%v)) Currently, our term is %v. setting it to %v", rf.me, follower, reply.Term, args.Term, rf.currentTerm, max(rf.currentTerm, reply.Term))
+
+			if reply.Term >= rf.currentTerm {
+				DPrintf("[%v] calling becomeFoll in pushLogs to %v. reply.Term (%v) > args.Term (%v) && reply.Term >= rf.currentTerm (T%v)", rf.me, follower, reply.Term, args.Term, rf.currentTerm)
+				rf.becomeFollower()
+			}
+
+			rf.currentTerm = max(rf.currentTerm, reply.Term)
 
 			rf.persist()
-			rf.becomeFollower()
+
 			//rf.waitingOnRPC[follower] = false
 			//DPrintf("[%v] unsetting wait on RPC for foll %v due to invalid RPC sent (not leader anymore)", rf.me, follower)
 
@@ -600,12 +629,12 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 		/// 1. If leader doesn't have xterm; nextIdx = xIdx
 		/// 2. If leader has xterm; nextIdx = idx of leader's last entry for xterm
 		/// 3. follower's log is too short; nextIdx = xLen
-		DPrintf("[%v] before fast back up processing of foll %v", rf.me, follower)
+		//DPrintf("[%v] before fast back up processing of foll %v", rf.me, follower)
 		if !reply.Success {
 			rf.processLogInconsistency(follower, reply.XIdx, reply.XTerm, reply.XLength)
 			continue
 		}
-		DPrintf("[%v] after fast back up processing", rf.me)
+		//DPrintf("[%v] after fast back up processing", rf.me)
 
 		// We have success - update nextIdx and matchIdx
 		//DPrintf("[%v] updating (for foll %v) nextIdx: %v -> %v. matchIdx: %v -> %v", rf.me, follower, rf.nextIdx[follower], rf.nextIdx[follower]+len(entriesToSend), rf.matchIdx[follower], args.PrevLogIdx+len(entriesToSend))
@@ -751,7 +780,7 @@ func (rf *Raft) ticker() {
 			// if a follower has not received a HB recently, go directly to candidate state
 
 			if time.Since(rf.lastHeartbeat) > rf.heartbeatTimeout {
-				DPrintf("[%v] (foll) heartbeatTimeout occurred. becoming %v cand, starting election", rf.me, rf.currentTerm+1)
+				DPrintf("[%v] (foll) heartbeatTimeout occurred. becoming T%v cand, starting election", rf.me, rf.currentTerm+1)
 				rf.becomeCandidate()
 				rf.broadcastVotes()
 				rf.mu.Unlock()
@@ -766,7 +795,7 @@ func (rf *Raft) ticker() {
 
 			// Now, we've already started an election (from starting in follower state), but check to see if its gone on too long
 			if time.Since(rf.electionStartedAt) > rf.electionTimeout {
-				//DPrintf("[%v] (cand) electionTimeout occurred. becoming cand, restarting election", rf.me)
+				DPrintf("[%v] (cand) electionTimeout occurred. becoming T%v cand again, restarting election", rf.me, rf.currentTerm+1)
 				rf.becomeCandidate()
 				rf.broadcastVotes()
 				//go rf.startElection()
@@ -804,7 +833,7 @@ func (rf *Raft) ticker() {
 					//}
 				} else {
 					// Not necessary to send HBs to self b/c we only check for !recentHBReceived if we're a follower or cand
-					DPrintf("[%v] sending HB to foll %v", rf.me, i)
+					//DPrintf("[%v] sending HB to foll %v", rf.me, i)
 					go rf.sendHeartbeatToNode(i)
 				}
 			}
@@ -832,20 +861,24 @@ func (rf *Raft) broadcastVotes() {
 
 func (rf *Raft) becomeFollower() {
 	if rf.state != followerNode {
+		DPrintf("[%v] in becomeFollower, switching from %v to foll & reseting lastHB to now", rf.me, rf.state)
 		rf.state = followerNode
 		rf.lastHeartbeat = time.Now() // if we're already a follower, don't keep resetting this (we could time out of the test before anyone becomes elected)
+	} else {
+		DPrintf("[%v] in becomeFollower, already foll", rf.me)
 	}
 }
 
 // Call when rf.mu is locked
 func (rf *Raft) becomeCandidate() {
+	DPrintf("[%v] switching from state %v to state %v (cand)", rf.me, rf.state, candidateNode)
 	rf.state = candidateNode
 	rf.currentTerm++
 	rf.votesCollected = make([]bool, len(rf.peers))
 	rf.votesCollected[rf.me] = true
 	rf.votedFor = rf.me
-	rf.resetElectionTimeout()
 	rf.persist()
+	rf.resetElectionTimeout()
 }
 
 func (rf *Raft) becomeLeader() {
@@ -896,16 +929,18 @@ func (rf *Raft) sendHeartbeatToNode(nodeIdx int) {
 		// What if the follower is disconnected? We'll remain leader, sending HBs to other (connected) followers
 		// This sounds good - don't downgrade on network fail
 	} else if reply.Term > args.Term {
-		rf.currentTerm = reply.Term
-		DPrintf("[%v] received not success response to AE on send of HB to foll %v (foll's term > ours). becoming follower", rf.me, nodeIdx)
-		rf.becomeFollower()
+		DPrintf("[%v] received not success response to AE on send of HB to foll %v (foll's term (T%v) > ours, the one we sent (T%v)) Currently. our term is %v. setting it to %v", rf.me, nodeIdx, reply.Term, args.Term, rf.currentTerm, max(rf.currentTerm, reply.Term))
+		if reply.Term >= rf.currentTerm {
+			DPrintf("[%v] calling becomeFoll in sendHB. reply.Term (%v) > args.Term (%v) && reply.Term >= rf.currentTerm (T%v)", rf.me, reply.Term, args.Term, rf.currentTerm)
+			rf.becomeFollower()
+		}
+		rf.currentTerm = max(rf.currentTerm, reply.Term)
+		rf.persist()
 	} else if !reply.Success {
 		// Get to here if there's a log inconsistency
 		DPrintf("[%v] (leader) processing log incons. with %v (follower) after HB sent", rf.me, nodeIdx)
 		rf.processLogInconsistency(nodeIdx, reply.XIdx, reply.XTerm, reply.XLength)
 	}
-	//DPrintf("[%v] persist: save after sending HB {l%v, T%v v%v}", rf.me, len(rf.log), rf.currentTerm, rf.votedFor)
-	rf.persist()
 }
 
 func (rf *Raft) resetElectionTimeout() {
@@ -941,7 +976,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
 	rf.votesCollected = make([]bool, len(rf.peers))
-	rf.heartbeatTimeout = 150 * time.Millisecond // Tested from 50 - 250, 150 seemed best
+	rf.heartbeatTimeout = time.Duration(300+(rand.Int63()%300)) * time.Millisecond
 	//DPrintf("[%v] initial reset of election timer", rf.me)
 	rf.electionTimeout = time.Duration(300+(rand.Int63()%300)) * time.Millisecond
 	rf.lastHeartbeat = time.Now()
