@@ -75,10 +75,9 @@ type Raft struct {
 	// state and votesCollected need locking
 	state          serverType
 	votesCollected []bool
-	//waitingOnRPC   []bool
 
 	// Timeout properties - don't need locking
-	electionTimeout   time.Duration // if we start an election, how long to wait for RV rpcs to return and candidate to be elected before restarting it
+	electionTimeout   time.Duration // if we start an election, how long to wait for RV rpcs to return and candidate to be elected before restarting it, Or between HBs
 	electionStartedAt time.Time
 	heartbeatTimeout  time.Duration // time frame in which folls & cands are unhappy if it passes completely, a constant atm
 	lastHeartbeat     time.Time     // time at which we, as a follower, last received an AE RPC (doesn't matter if we're the one sending it out)
@@ -190,7 +189,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// Otherwise, candidate (aka RPC requester)'s term is >= ours
 
-	// If our term is behind, reset votedFor and state
+	// If our term is behind, reset votedFor and become follower
 	if args.Term > rf.currentTerm {
 		rf.votedFor = -1
 		rf.persist()
@@ -219,9 +218,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.becomeFollower()
 		}
 	}
-
-	//rf.persist()
-
 }
 
 // For a yes vote, the candidate's log must also be at least as up to date as the voters
@@ -279,31 +275,23 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) handleRVReply(follower int, args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if args.Term != rf.currentTerm { // todo: rewrite logic
-		// First, ensure no other goroutine bumped currentTerm while this goroutine was waiting on sendRV(). If currentTerm is no longer == args.Term, -> this node is already a follower, and we skip voteCount++, even if vote granted, etc
-	} else if reply.Term > args.Term {
-		DPrintf("[%v] (cand) received RV reply from %v. the term we sent (T%v) < other's (T%v). Setting our term to %v", rf.me, follower, args.Term, reply.Term, max(rf.currentTerm, reply.Term))
-		if reply.Term >= rf.currentTerm {
-			DPrintf("[%v] calling becomeFoll in handleRVReply (reply from %v). reply.Term (%v) > args.Term (%v) && reply.Term >= rf.currentTerm (T%v)", rf.me, follower, reply.Term, args.Term, rf.currentTerm)
-			rf.becomeFollower()
-		}
-		rf.currentTerm = max(rf.currentTerm, reply.Term)
-		rf.persist()
-		//else if rf.currentTerm < reply.Term {
-		//	// if this cand's term is less than RPC recipient's term, we'll have to update our term and convert us to follower. vote will not have been granted
-		//	DPrintf("[%v] (cand) becoming follower after receiving RV reply from %v. as our term (T%v) < other's (T%v), which we're setting our term to", rf.me, follower, rf.currentTerm, reply.Term)
-		//	rf.currentTerm = reply.Term
-		//	//DPrintf("[%v] persist: save after receiving RV rpc response, updating rf.currentTerm {l%v, T%v v%v}", rf.me, len(rf.log), rf.currentTerm, rf.votedFor)
-		//	rf.persist()
-		//	//rf.becomeCandidate()
-		//
-		//	rf.becomeFollower()
-	} else if reply.VoteGranted && rf.state == candidateNode {
-		// Check to ensure we're still a candidate
-		//DPrintf("[%v] received yes vote from foll %v", rf.me, follower)
-		rf.votesCollected[follower] = true
-		if rf.quorumVoted() {
-			rf.becomeLeader()
+	// First, ensure no other goroutine bumped currentTerm while this goroutine was waiting on sendRV(). If currentTerm is no longer == args.Term, -> this node is already a follower, and we skip voteCount++, even if vote granted, etc
+	if args.Term == rf.currentTerm {
+		if reply.Term > args.Term {
+			DPrintf("[%v] (cand) received RV reply from %v. the term we sent (T%v) < other's (T%v). Setting our term to %v", rf.me, follower, args.Term, reply.Term, max(rf.currentTerm, reply.Term))
+			if reply.Term >= rf.currentTerm {
+				DPrintf("[%v] calling becomeFoll in handleRVReply (reply from %v). reply.Term (%v) > args.Term (%v) && reply.Term >= rf.currentTerm (T%v)", rf.me, follower, reply.Term, args.Term, rf.currentTerm)
+				rf.becomeFollower()
+			}
+			rf.currentTerm = max(rf.currentTerm, reply.Term)
+			rf.persist()
+		} else if reply.VoteGranted && rf.state == candidateNode {
+			// Check to ensure we're still a candidate
+			//DPrintf("[%v] received yes vote from foll %v", rf.me, follower)
+			rf.votesCollected[follower] = true
+			if rf.quorumVoted() {
+				rf.becomeLeader()
+			}
 		}
 	}
 }
@@ -370,8 +358,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Now, early exit if log is inconsistent with leaders. with extra (fast backup) information if my (foll) log is not consistent up to where args.Entries starts in leader log
 	if !rf.logIsConsistentWithLeaderBeforeArgsEntries(args.PrevLogIdx, args.PrevLogTerm) {
 		reply.Success = false
-		// Case 3 first: Is leader's prevLogIdx out of range of our log
 		if args.PrevLogIdx >= len(rf.log) {
+			// Case 3 first: Is leader's prevLogIdx out of range of our log
 			reply.XLength = len(rf.log)
 			reply.XTerm = -1
 			reply.XIdx = -1
@@ -380,7 +368,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// Case 1, 2 are the same from follower's pov. Leader must distinguish with returned xTerm, xIdx info
 			reply.XTerm = rf.log[args.PrevLogIdx].Term
 			reply.XIdx = rf.getFirstIdxWithTerm(reply.XTerm)
-			reply.XLength = len(rf.log) // won't be used
+			reply.XLength = len(rf.log) // won't be used in this case
 			DPrintf("[%v] found case 1,2 inconsistency on AE from %v of %v entries", rf.me, args.LeaderId, len(args.Entries))
 		}
 		return
@@ -391,11 +379,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// Here, my (foll) log is consistent with leader's log up to args.Entries.
-
-	// Sanity check - we're not about to delete an already committed entry, are we???
-	if rf.commitIndex > args.PrevLogIdx {
-		//fmt.Printf("Occassionally we'll reach here if we're getting entries we already have. // TODO but check: if any of our entries at commitIdx or higher DO NOT exist in args.Entries, we have a problem - we cannot overwrite committed entries with anything else.
-	}
 
 	// Delete and append as necessary
 	reply.Success = true
@@ -413,19 +396,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.log = append(rf.log, args.Entries...)
 	}
 
-	// // TODO: do this on HB? Maybe not, but then we have to check periodically?
 	// Now, update commitIndex
 	//DPrintf("[%v] received & appended entries from leader %v. Is args.LeaderCommit (%v) > rf.commitIdx (%v)? %v. args.PrevLogIdx: %v", rf.me, args.LeaderId, args.LeaderCommit, rf.commitIndex, args.LeaderCommit > rf.commitIndex, args.PrevLogIdx)
 	if args.LeaderCommit > rf.commitIndex {
 
 		DPrintf("[%v] updating commitIdx from %v to min(%v, %v)", rf.me, rf.commitIndex, args.LeaderCommit, len(rf.log)-1)
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
-		//rf.commitIndex = min(args.LeaderCommit, args.PrevLogIdx+len(args.Entries)) // TODO: I think this line is correct instead of above???
 
 		rf.attemptApply()
 	}
 
-	// With normal exit, we've edited rf.log, rf.currentTerm (must remain persistent). Save before returning
+	// With normal exit, we've edited rf.log, rf.currentTerm (must remain persistent). Persist before returning
 	//DPrintf("[%v] persist: save. at end of AE RPC handler {l%v, T%v v%v}", rf.me, len(rf.log), rf.currentTerm, rf.votedFor)
 	rf.persist()
 
@@ -441,23 +422,6 @@ func (rf *Raft) logIsConsistentWithLeaderBeforeArgsEntries(leaderPrevEntryIdx in
 	DPrintf("[%v] is log consistent with leader log before args.Entries?: %v", rf.me, ret)
 	return ret
 }
-
-//func (rf *Raft) applyPeriodically() {
-//	for !rf.killed() {
-//		rf.mu.Lock()
-//		if rf.commitIndex > rf.lastApplied {
-//			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-//				DPrintf("[%v] sending applyMsg idx %v. commitIdx (%v) > lastApplied (%v)", rf.me, i, rf.commitIndex, rf.lastApplied)
-//				rf.mu.Unlock() // TODO remove this set?
-//				rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Cmd, CommandIndex: i}
-//				rf.mu.Lock()
-//				rf.lastApplied++
-//			}
-//		}
-//		rf.mu.Unlock()
-//		time.Sleep(time.Duration(50) * time.Millisecond)
-//	}
-//}
 
 func (rf *Raft) attemptApply() {
 	// if commitIdx > lastApplied, send to apply channel
@@ -570,28 +534,23 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 
 		var reply AppendEntriesReply
 
-		//rf.waitingOnRPC[follower] = true
 		//DPrintf("[%v] setting wait on RPC for foll %v", rf.me, follower)
 
 		//DPrintf("[%v] sending AE to foll %v: %v entries", rf.me, follower, len(args.Entries))
-		//argsEntriesLenBeforeAeRpc := len(args.Entries)
 		//DPrintf("[%v] about to unlock for sendAE in pushLogs", rf.me)
 		rf.mu.Unlock()
 		//DPrintf("[%v] unlocked for sendAE in pushLogs", rf.me)
 		ok := rf.sendAppendEntries(follower, &args, &reply)
 		rf.mu.Lock()
-		//argsEntriesLenAfterAeRpc := len(args.Entries)
 		//DPrintf("[%v] argsEntries Before & After sending them to follower %v in AE: before (%v) and after (%v) Are they equal? %v", rf.me, follower, argsEntriesLenBeforeAeRpc, argsEntriesLenAfterAeRpc, argsEntriesLenBeforeAeRpc == argsEntriesLenAfterAeRpc)
 
 		if !ok {
 			// next tick we'll spawn a new pushLogsToFollower(), and we want the current goroutine to have ended
 			// The new goroutine will handle new logs and previous ones (those the current goroutine failed to push)
 			DPrintf("[%v] attempt to send AE to foll %v failed (%v entries): !ok", rf.me, follower, len(args.Entries))
-			//rf.waitingOnRPC[follower] = false
 			//DPrintf("[%v] unsetting wait on RPC for foll %v due to bad rpc response", rf.me, follower)
 
-			// Should we become follower here??? No: see logic in sendHB
-			//rf.becomeFollower()
+			// Should we become follower here? No: see logic in sendHB
 			return
 		}
 
@@ -618,7 +577,6 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 
 			rf.persist()
 
-			//rf.waitingOnRPC[follower] = false
 			//DPrintf("[%v] unsetting wait on RPC for foll %v due to invalid RPC sent (not leader anymore)", rf.me, follower)
 
 			return
@@ -641,13 +599,8 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 		// Increment monotonically
 		var newNextIdx int
 		// On non-HBs, where we're sending the first entry,
-		//if args.PrevLogIdx == 0 && len(args.Entries) > 0 {
-		//	fmt.Println("REACHED")
-		//	newNextIdx = max(rf.nextIdx[follower]+len(entriesToSend), 1+len(entriesToSend))
-		//} else {
 
 		// If we're sending the first log entry, and args.PrevLogIdx == 0, treat it as 1
-		//newNextIdx = max(rf.nextIdx[follower]+len(entriesToSend), args.PrevLogIdx+len(entriesToSend), 1+len(entriesToSend))
 
 		DPrintf("[%v] in pushLogs is setting nextIdx for foll %v from %v to max(%v, %v)", rf.me, follower, rf.nextIdx[follower], rf.nextIdx[follower]+len(entriesToSend), 1+len(entriesToSend))
 		newNextIdx = max(rf.nextIdx[follower]+len(entriesToSend), 1+len(entriesToSend))
@@ -672,7 +625,6 @@ func (rf *Raft) pushLogsToFollower(follower int) {
 				}
 			}
 		}
-		//rf.waitingOnRPC[follower] = false
 		//DPrintf("[%v] unsetting wait on RPC for foll %v due to successful push", rf.me, follower)
 		break
 	}
@@ -701,10 +653,6 @@ func (rf *Raft) lookupXTerm(follXTerm int) (hasXTerm bool, leaderXTermIdx int) {
 	// if found, return true, that first entry's idx
 	// if not found, return false, -1
 	for i := len(rf.log) - 1; i > 0; i-- {
-		// TODO: WE shouldn't skip if we've already been committed - should we skip if we haven't been committed?
-		//if i <= rf.commitIndex {
-		//	continue
-		//}
 		leaderEntry := rf.log[i]
 		if leaderEntry.Term == follXTerm {
 			DPrintf("[%v] (leader) found an entry at %v with follower's conflicting term %v", rf.me, i, follXTerm)
@@ -748,24 +696,6 @@ func (rf *Raft) isInSameTerm(logIdx int) bool {
 	return ret
 }
 
-//func (rf *Raft) apply() {
-//	for !rf.killed() {
-//		time.Sleep(time.Duration(40) * time.Millisecond)
-//
-//		rf.mu.Lock()
-//
-//		// if commitIdx > lastApplied, send to apply channel
-//		if rf.commitIndex > rf.lastApplied {
-//			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-//				//DPrintf("[%v] sending applyMsg idx %v. commitIdx (%v) > lastApplied (%v)", rf.me, i, rf.commitIndex, rf.lastApplied)
-//				rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Cmd, CommandIndex: i}
-//				rf.lastApplied++
-//			}
-//		}
-//		rf.mu.Unlock()
-//	}
-//}
-
 // A ticker function that handlers the election process
 func (rf *Raft) ticker() {
 
@@ -791,24 +721,14 @@ func (rf *Raft) ticker() {
 			// First time around, we'll get here after becoming cand. and immediately coming here. !rf.recHBRec will still be true, so go startElec.
 			// Then, wait. Hopefully, while we're waiting, we'll vote for self & receive HB. We could still be cand, but no new election spawned. Wait again, maybe by next time around we'll win and be leader
 			// But maybe network failure, we won't vote for self so no HB received. we'll still be cand - go start another election.
-			//if !rf.recentHeartbeatReceived {
 
 			// Now, we've already started an election (from starting in follower state), but check to see if its gone on too long
 			if time.Since(rf.electionStartedAt) > rf.electionTimeout {
 				DPrintf("[%v] (cand) electionTimeout occurred. becoming T%v cand again, restarting election", rf.me, rf.currentTerm+1)
 				rf.becomeCandidate()
 				rf.broadcastVotes()
-				//go rf.startElection()
-				//} else {
-				//	// if we have received a recent HB, reset it, proceed to wait again
-				//	rf.recentHeartbeatReceived = false
-				//rf.lastHeartbeat = time.Now()
 			}
 		case leaderNode:
-			//if time.Since(rf.lastHeartbeat) > rf.heartbeatTimeout {
-			//	DPrintf("[%v] resetting heartbeat timer as its been a while", rf.me)
-			//	rf.lastHeartbeat = time.Now()
-			//}
 			// check our log: do we see a new entry? (aka is leader's lastLogIdx >= follower's nextIdx?) if so, startAgreement. Otherwise, send HBs to everyone.
 
 			// Loop through followers. Push new entries via startAgreement OR send HB in this idle period. For self, ensure matchIdx is correct
@@ -820,17 +740,12 @@ func (rf *Raft) ticker() {
 					rf.matchIdx[rf.me] = rf.commitIndex
 
 					// Usually, we notify nodes of HB on pushLogs or sendHB, but since we'll skip that for ourself, tell ourself to record a HB
-					//rf.lastHeartbeat = time.Now()
 
 					// if our log's last len is greater than the nextIdx
 				} else if len(rf.log) > rf.nextIdx[i] {
-					//if !rf.waitingOnRPC[i] { // don't spawn new pushLogs if still waiting for the last one
 					// If we have a new log entry that must be pushed to follower i, spawn agreement process
 					//DPrintf("[%v] will push %v entries to foll %v as nextIdx[i] is: %v and len(rf.log) is %v", rf.me, len(rf.log[rf.nextIdx[i]:]), i, rf.nextIdx[i], len(rf.log))
 					go rf.pushLogsToFollower(i)
-					//} else {
-					//	DPrintf("[%v] not respawning pushLogs goroutine", rf.me) // todo: problematic when nodes are disconnected? or good?
-					//}
 				} else {
 					// Not necessary to send HBs to self b/c we only check for !recentHBReceived if we're a follower or cand
 					//DPrintf("[%v] sending HB to foll %v", rf.me, i)
@@ -902,7 +817,6 @@ func (rf *Raft) sendHeartbeatToNode(nodeIdx int) {
 	var reply AppendEntriesReply
 	// When thinking about PrevLog in a HB - we have 0 entries to apply to follower, so the previous entry is just the last one in this leader's log
 	// Important for determining whether to overwrite
-	//args := AppendEntriesArgs{rf.currentTerm, rf.me, len(rf.log) - 1, rf.log[len(rf.log)-1].Term, make([]*entry, 0), rf.commitIndex}
 	args := AppendEntriesArgs{rf.currentTerm, rf.me, rf.nextIdx[nodeIdx] - 1, rf.log[len(rf.log)-1].Term, make([]*entry, 0), rf.commitIndex}
 
 	if rf.state != leaderNode {
@@ -986,12 +900,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.readPersist(persister.ReadRaftState())
 
-	// start periodic check for committed logs so they can be applied (this will be more frequent than ticker)
-	//go rf.commit()
-
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	//go rf.applyPeriodically()
 
 	return rf
 }
